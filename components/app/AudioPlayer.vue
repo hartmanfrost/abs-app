@@ -715,7 +715,8 @@ export default {
       this.closePlayback()
     },
     touchstart(e) {
-      if (!e.changedTouches || this.$store.state.globals.isModalOpen) return
+      // The transcript view handles its own swipes; a downward swipe must not minimize the player
+      if (!e.changedTouches || this.$store.state.globals.isModalOpen || this.showTranscript) return
       const touchPosY = e.changedTouches[0].pageY
       // when minimized only listen to touchstart on the player
       if (!this.showFullscreen && touchPosY < window.innerHeight - 120) return
@@ -730,7 +731,7 @@ export default {
       this.touchStartTime = Date.now()
     },
     touchend(e) {
-      if (!e.changedTouches) return
+      if (!e.changedTouches || this.showTranscript) return
       const touchDuration = Date.now() - this.touchStartTime
       const touchEndY = e.changedTouches[0].pageY
       const touchDistanceY = touchEndY - this.touchStartY
