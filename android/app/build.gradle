@@ -36,7 +36,7 @@ android {
     applicationId "com.audiobookshelf.app"
     minSdkVersion rootProject.ext.minSdkVersion
     targetSdkVersion rootProject.ext.targetSdkVersion
-    versionCode 117
+    versionCode 118
     versionName "0.13.0-beta"
     testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     manifestPlaceholders = [
@@ -50,10 +50,20 @@ android {
   }
   signingConfigs {
     release {
-      storeFile = android.signingConfigs.debug.storeFile
-      storePassword = android.signingConfigs.debug.storePassword
-      keyAlias = android.signingConfigs.debug.keyAlias
-      keyPassword = android.signingConfigs.debug.keyPassword
+      // A dedicated release keystore can be supplied through the environment (kept outside git);
+      // without it the release variant falls back to the debug keystore, as before.
+      def ksFile = System.getenv('ABS_KEYSTORE_FILE')
+      if (ksFile) {
+        storeFile = file(ksFile)
+        storePassword = System.getenv('ABS_KEYSTORE_PASSWORD')
+        keyAlias = System.getenv('ABS_KEY_ALIAS') ?: 'abs-tv'
+        keyPassword = System.getenv('ABS_KEY_PASSWORD') ?: System.getenv('ABS_KEYSTORE_PASSWORD')
+      } else {
+        storeFile = android.signingConfigs.debug.storeFile
+        storePassword = android.signingConfigs.debug.storePassword
+        keyAlias = android.signingConfigs.debug.keyAlias
+        keyPassword = android.signingConfigs.debug.keyPassword
+      }
     }
   }
   buildTypes {
