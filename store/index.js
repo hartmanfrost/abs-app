@@ -7,6 +7,7 @@ export const state = () => ({
   currentPlaybackSession: null,
   playerIsPlaying: false,
   playerIsFullscreen: false,
+  transcriptOpen: false, // Transcript viewer visible (also held briefly after close so Back does not minimize the player)
   playerIsStartingPlayback: false, // When pressing play before native play response
   playerStartingPlaybackMediaId: null,
   isCasting: false,
@@ -161,6 +162,9 @@ export const mutations = {
   },
   setPlayerFullscreen(state, val) {
     state.playerIsFullscreen = val
+  },
+  setTranscriptOpen(state, val) {
+    state.transcriptOpen = !!val
   },
   setPlayerIsStartingPlayback(state, mediaId) {
     state.playerStartingPlaybackMediaId = mediaId

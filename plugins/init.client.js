@@ -312,6 +312,11 @@ export default ({ store, app }, inject) => {
       eventBus.$emit('close-ebook')
       return
     }
+    if (store.state.transcriptOpen) {
+      // Transcript viewer sits on top of the fullscreen player: Back steps out of it first
+      eventBus.$emit('transcript-back')
+      return
+    }
     if (store.state.playerIsFullscreen) {
       eventBus.$emit('minimize-player')
       return

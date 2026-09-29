@@ -63,6 +63,8 @@
           </div>
 
           <span tabindex="0" class="material-symbols text-3xl text-fg cursor-pointer" :class="chapters.length ? 'text-opacity-75' : 'text-opacity-10'" @click="clickChaptersBtn" @keydown.enter.prevent="clickChaptersBtn">format_list_bulleted</span>
+
+          <span v-if="hasTranscript" ref="transcriptBtn" tabindex="0" class="material-symbols text-3xl text-fg text-opacity-75 cursor-pointer" :aria-label="$strings.LabelTranscript" :title="$strings.LabelTranscript" @click="showTranscript = true" @keydown.enter.prevent.stop="showTranscript = true">subtitles</span>
         </div>
       </div>
       <div v-else class="w-full h-full absolute top-0 left-0 pointer-events-none" style="background: var(--gradient-minimized-audio-player)" />
@@ -105,6 +107,8 @@
       </div>
     </div>
 
+    <app-transcript-view v-if="showTranscript && showFullscreen && hasTranscript" :library-item-id="transcriptItemId" :sources="transcriptSources" :current-time="currentTime" :is-playing="isPlaying" :playback-rate="currentPlaybackRate" :chapters="chapters" :cover-color="coverRgb" @seek="seek" @toggle-play="playPauseClick" @close="closeTranscript" />
+
     <modals-chapters-modal v-model="showChapterModal" :current-chapter="currentChapter" :chapters="chapters" :playback-rate="currentPlaybackRate" @select="selectChapter" />
     <modals-dialog v-model="showMoreMenuDialog" :items="menuItems" width="80vw" @action="clickMenuAction" />
   </div>
@@ -118,6 +122,7 @@ import { KeepAwake } from '@capacitor-community/keep-awake'
 import { getAverageColorFromCoverUrl } from '@/utils/coverAverageColor'
 import WrappingMarquee from '@/assets/WrappingMarquee.js'
 import jumpLabelMixin from '@/mixins/jumpLabel'
+import { fetchTranscriptSources } from '@/utils/transcriptLoader'
 
 export default {
   props: {
@@ -168,11 +173,15 @@ export default {
       coverRgb: 'rgb(55, 56, 56)',
       coverBgIsLight: false,
       titleMarquee: null,
-      isRefreshingUI: false
+      isRefreshingUI: false,
+      // Sidecar .vtt/.srt transcript files found for the playing book (see utils/transcript.js)
+      transcriptSources: [],
+      showTranscript: false
     }
   },
   watch: {
     showFullscreen(val) {
+      if (!val) this.showTranscript = false
       this.updateScreenSize()
       this.$store.commit('setPlayerFullscreen', !!val)
       document.querySelector('body').style.backgroundColor = this.showFullscreen ? this.coverRgb : ''
@@ -392,6 +401,12 @@ export default {
     socketConnected() {
       return this.$store.state.socketConnected
     },
+    transcriptItemId() {
+      return this.playbackSession?.libraryItemId || ''
+    },
+    hasTranscript() {
+      return !this.isPodcast && !!this.transcriptItemId && this.transcriptSources.length > 0
+    },
     mediaId() {
       if (this.isPodcast || !this.playbackSession) return null
       if (this.playbackSession.libraryItemId) {
@@ -410,6 +425,21 @@ export default {
         message: this.$strings.MessageProgressSyncFailed,
         cancelText: this.$strings.ButtonOk
       })
+    },
+    // Look up sidecar transcripts for the playing book (no-op for podcasts / when the server is unreachable)
+    async loadTranscriptSources() {
+      this.transcriptSources = []
+      this.showTranscript = false
+      const itemId = this.playbackSession?.libraryItemId
+      if (!itemId || this.isPodcast) return
+      const sources = await fetchTranscriptSources(this.$nativeHttp, itemId)
+      // Ignore the answer if another book started meanwhile
+      if (this.playbackSession?.libraryItemId === itemId) this.transcriptSources = sources
+    },
+    closeTranscript() {
+      this.showTranscript = false
+      // Give D-pad focus back to the button that opened the transcript
+      this.$nextTick(() => this.$refs.transcriptBtn?.focus({ preventScroll: true }))
     },
     clickChaptersBtn() {
       if (!this.chapters.length) return
@@ -802,6 +832,8 @@ export default {
       AbsAudioPlayer.closePlayback()
     },
     endPlayback() {
+      this.transcriptSources = []
+      this.showTranscript = false
       this.$store.commit('setPlaybackSession', null)
       this.showFullscreen = false
       this.isEnded = false
@@ -884,6 +916,7 @@ export default {
     onPlaybackSession(playbackSession) {
       console.log('onPlaybackSession received', JSON.stringify(playbackSession))
       this.playbackSession = playbackSession
+      this.loadTranscriptSources()
 
       this.isEnded = false
       this.isLoading = true
