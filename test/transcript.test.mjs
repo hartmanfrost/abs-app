@@ -1,6 +1,7 @@
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
-import { parseTimestamp, parseTranscript, parseTranscriptAsync, findCueIndex, findWordIndex, searchCues, offsetCues, mergeCues, pickTranscriptSources, formatClock } from '../utils/transcript.js'
+import { parseTimestamp, parseTranscript, parseTranscriptAsync, findCueIndex, findWordIndex, searchCues, offsetCues, mergeCues, pickTranscriptSources, formatClock, parseCuePayload, buildBlocks, seekTimeForCue, getSpokenIndex, FLAG_ITALIC, FLAG_BOLD, FLAG_UNDERLINE, FLAG_UNSPOKEN } from '../utils/transcript.js'
 
 const VTT = `WEBVTT
 
@@ -178,4 +179,280 @@ test('formatClock', () => {
   assert.equal(formatClock(65), '1:05')
   assert.equal(formatClock(3725), '1:02:05')
   assert.equal(formatClock(-3), '0:00')
+})
+
+// ---------------------------------------------------------------------------------------------
+// Book mode: full printed text with timings (cue ids, <i><b><u>, <c.unspoken>)
+// ---------------------------------------------------------------------------------------------
+
+const cue = (payload, start = 10) => parseCuePayload(payload, start, true)
+
+test('book markup: italic / bold / underline runs, timestamps inside styled spans', () => {
+  const r = cue('Plain <i>ital <00:00:11.000>ic</i> <b>bold</b> <u>under</u>.')
+  assert.equal(r.text, 'Plain ital ic bold under.')
+  assert.deepEqual(
+    r.segs.map((s) => [s.w, s.f]),
+    [
+      ['Plain ', 0],
+      ['ital ', FLAG_ITALIC],
+      ['ic', FLAG_ITALIC],
+      [' ', 0],
+      ['bold', FLAG_BOLD],
+      [' ', 0],
+      ['under', FLAG_UNDERLINE],
+      ['.', 0]
+    ]
+  )
+  // the timestamp splits the italic run into two words; the first word relies on the cue start
+  assert.deepEqual(
+    r.words.map((w) => [w.t, w.w]),
+    [
+      [10, 'Plain ital '],
+      [11, 'ic bold under.']
+    ]
+  )
+  assert.equal(r.spoken, true)
+})
+
+test('book markup: nested spans and stack-based closing', () => {
+  const r = cue('<i>a <b>b</b> c</i> d <i><c.unspoken>tag</c></i> <c.karaoke>e</c>')
+  assert.equal(r.text, 'a b c d tag e')
+  const byText = Object.fromEntries(r.segs.map((s) => [s.w.trim(), s.f]))
+  assert.equal(byText.a, FLAG_ITALIC)
+  assert.equal(byText.b, FLAG_ITALIC | FLAG_BOLD)
+  assert.equal(byText.c, FLAG_ITALIC)
+  assert.equal(byText.d, 0)
+  assert.equal(byText.tag, FLAG_ITALIC | FLAG_UNSPOKEN)
+  assert.equal(byText.e, 0) // unknown <c.karaoke> class is just dropped
+})
+
+test('unspoken runs are visible text but never words', () => {
+  const r = cue('“Go!” <c.unspoken>yelled Tom.</c> <00:00:12.500>Then <00:00:13.000>silence.')
+  assert.equal(r.text, '“Go!” yelled Tom. Then silence.')
+  assert.deepEqual(
+    r.words.map((w) => [w.t, w.w]),
+    [
+      [10, '“Go!” '],
+      [12.5, 'Then '],
+      [13, 'silence.']
+    ]
+  )
+  const un = r.segs.find((s) => s.f & FLAG_UNSPOKEN)
+  assert.equal(un.w, 'yelled Tom.')
+  assert.equal(un.k, -1)
+  // every spoken run points at a word, joined words never contain unspoken text
+  assert.ok(!r.words.map((w) => w.w).join('').includes('yelled'))
+})
+
+test('a fully unspoken cue has no words and is not spoken', () => {
+  const r = cue('<c.unspoken>(He left at noon.)</c>')
+  assert.equal(r.spoken, false)
+  assert.equal(r.words, null)
+  assert.equal(r.text, '(He left at noon.)')
+})
+
+test('entities, curly quotes, em-dashes, ALL CAPS stay literal', () => {
+  const r = cue('“I DO NOT&nbsp;CARE!” Tom &amp; Jo &lt;3 — &quot;ok&quot;')
+  assert.equal(r.text, '“I DO NOT CARE!” Tom & Jo <3 — "ok"')
+  assert.equal(r.segs, null) // nothing styled: render text directly
+})
+
+test('deliberate newlines are kept in book mode and folded in legacy mode', () => {
+  assert.equal(cue('Dear Sir,\nthanks  for\n  all').text, 'Dear Sir,\nthanks for\nall')
+  assert.equal(parseCuePayload('Dear Sir,\nthanks', 0).text, 'Dear Sir, thanks')
+  // newline across a tag boundary wins over the neighbouring space
+  assert.equal(cue('line one <i>\nline two</i>').text, 'line one\nline two')
+})
+
+test('cue ids: sentences, headings, chapters; file order is kept (no sort by time)', () => {
+  const text = readFileSync(new URL('./fixtures/book-contract.vtt', import.meta.url), 'utf8')
+  const { cues, bookMode, hasWords } = parseTranscript(text)
+  assert.equal(bookMode, true)
+  assert.equal(hasWords, true)
+  assert.equal(cues[0].id, 'c01-h')
+  assert.equal(cues[0].heading, true)
+  assert.equal(cues[0].text, 'CHAPTER ONE\nTHE LANTERN KEEPER')
+  assert.equal(cues[1].chapter, 1)
+  assert.equal(cues[1].para, 1)
+  assert.equal(cues[1].sent, 1)
+  // the fully unspoken cue with start 0 sits in reading order, not at the front
+  const i = cues.findIndex((c) => c.id === 'c01-p0001-s05')
+  assert.equal(cues[i].spoken, false)
+  assert.equal(cues[i].start, 0)
+  assert.equal(cues[i - 1].id, 'c01-p0001-s04')
+  assert.equal(cues[i + 1].id, 'c01-p0002-s01')
+  // ALL CAPS shout and unspoken tag
+  const shout = cues.find((c) => c.id === 'c01-p0001-s04')
+  assert.ok(shout.text.startsWith('“I DO NOT CARE!”'))
+  assert.ok(shout.segs.some((s) => s.f & FLAG_UNSPOKEN && s.w.startsWith('shouted')))
+  // letter keeps its line breaks, entity decoded
+  assert.equal(cues.find((c) => c.id === 'c01-p0003-s01').text, 'Dear Mr. Finch,\nThe harbour board thanks you\nfor forty years of service.')
+  assert.ok(cues.find((c) => c.id === 'c01-p0002-s01').text.includes('water & the gulls'))
+  // nested <i><c.unspoken>
+  const nested = cues.find((c) => c.id === 'c02-p0001-s01')
+  assert.ok(nested.segs.some((s) => s.w === 'he thought,' && s.f === (FLAG_ITALIC | FLAG_UNSPOKEN)))
+})
+
+test('buildBlocks groups sentences into paragraphs and headings into blocks', () => {
+  const text = readFileSync(new URL('./fixtures/book-contract.vtt', import.meta.url), 'utf8')
+  const { cues } = parseTranscript(text)
+  const { blocks, blockOf, book } = buildBlocks(cues)
+  assert.equal(book, true)
+  assert.deepEqual(
+    blocks.map((b) => b.kind),
+    ['h', 'p', 'p', 'p', 'h', 'p']
+  )
+  const p1 = blocks[1]
+  assert.equal(cues[p1.first].id, 'c01-p0001-s01')
+  assert.equal(cues[p1.last].id, 'c01-p0001-s05')
+  assert.equal(p1.firstSpoken, p1.first)
+  assert.equal(blockOf[p1.last], 1)
+  // chapter + paragraph together identify a paragraph: same p number in another chapter is a new block
+  assert.equal(blocks.length, 6)
+  const b2 = buildBlocks([
+    { id: 'c01-p0001-s01', chapter: 1, para: 1, sent: 1, text: 'a' },
+    { id: 'c02-p0001-s01', chapter: 2, para: 1, sent: 1, text: 'b' }
+  ])
+  assert.equal(b2.blocks.length, 2)
+})
+
+test('a fully unspoken paragraph has no first spoken cue; seek falls through to the next spoken cue', () => {
+  const vtt = `WEBVTT
+
+c01-p0001-s01
+00:00:01.000 --> 00:00:02.000
+Spoken one.
+
+c01-p0002-s01
+00:00:00.000 --> 00:00:00.000
+<c.unspoken>Only in print.</c>
+
+c01-p0003-s01
+00:00:05.000 --> 00:00:06.000
+Spoken <00:00:05.500>three.
+`
+  const { cues } = parseTranscript(vtt)
+  const { blocks } = buildBlocks(cues)
+  assert.equal(blocks.length, 3)
+  assert.equal(blocks[1].firstSpoken, -1)
+  assert.equal(seekTimeForCue(cues, 1), 5)
+  assert.equal(seekTimeForCue(cues, 2), 5)
+  assert.equal(seekTimeForCue(cues, 0), 1)
+  assert.equal(seekTimeForCue([{ start: 1, spoken: false, words: null, text: 'x' }], 0), -1)
+})
+
+test('findCueIndex ignores fully unspoken cues, whatever their start time', () => {
+  const vtt = `WEBVTT
+
+c01-p0001-s01
+00:00:01.000 --> 00:00:02.000
+One.
+
+c01-p0001-s02
+00:00:00.000 --> 00:00:00.000
+<c.unspoken>Bogus zero start.</c>
+
+c01-p0001-s03
+00:00:05.000 --> 00:00:06.000
+Three.
+
+c01-p0001-s04
+00:00:05.500 --> 00:00:05.500
+<c.unspoken>Overlaps the next.</c>
+
+c01-p0002-s01
+00:00:08.000 --> 00:00:09.000
+Four.
+`
+  const { cues } = parseTranscript(vtt)
+  assert.equal(findCueIndex(cues, 0.5), -1)
+  assert.equal(findCueIndex(cues, 1), 0)
+  assert.equal(findCueIndex(cues, 4), 0) // the unspoken cue at 0.0 must not win
+  assert.equal(findCueIndex(cues, 5.6), 2) // nor the one at 5.5
+  assert.equal(findCueIndex(cues, 99), 4)
+  assert.deepEqual([...getSpokenIndex(cues)], [0, 2, 4])
+})
+
+test('findCueIndex stays O(log n) with unspoken cues mixed in', () => {
+  const cues = Array.from({ length: 60000 }, (_, i) => (i % 5 === 3 ? { start: 0, spoken: false } : { start: i * 1.5 }))
+  const t0 = performance.now()
+  for (let i = 0; i < 100000; i++) findCueIndex(cues, (i * 7.3) % 90000)
+  assert.ok(performance.now() - t0 < 500)
+  assert.equal(findCueIndex(cues, 1.5 * 41234 + 0.1), 41234 % 5 === 3 ? 41233 : 41234)
+})
+
+test('legacy fallback: cues without ids keep sorting, one block per cue, no book fields', () => {
+  const { cues, bookMode } = parseTranscript(VTT)
+  assert.equal(bookMode, false)
+  assert.equal(cues[0].id, undefined)
+  assert.equal(cues[0].spoken, undefined)
+  assert.equal(cues[0].segs, undefined)
+  const { blocks, book } = buildBlocks(cues)
+  assert.equal(book, false)
+  assert.deepEqual(
+    blocks.map((b) => [b.first, b.last, b.kind]),
+    [
+      [0, 0, 'cue'],
+      [1, 1, 'cue'],
+      [2, 2, 'cue']
+    ]
+  )
+  // a mixed file: id-less cues become their own blocks next to paragraphs
+  const mixed = parseTranscript('WEBVTT\n\nc01-p0001-s01\n00:00:01.000 --> 00:00:02.000\na\n\nc01-p0001-s02\n00:00:02.000 --> 00:00:03.000\nb\n\n00:00:04.000 --> 00:00:05.000\nplain\n')
+  assert.deepEqual(
+    buildBlocks(mixed.cues).blocks.map((b) => b.kind),
+    ['p', 'cue']
+  )
+})
+
+test('numeric SRT-style identifiers and NOTE blocks are not mistaken for book ids', () => {
+  const { cues, bookMode } = parseTranscript('WEBVTT\n\nNOTE c01-p0001-s01\n\n7\n00:00:01.000 --> 00:00:02.000\nhello\n')
+  assert.equal(bookMode, false)
+  assert.equal(cues.length, 1)
+  assert.equal(cues[0].id, undefined)
+})
+
+test('offset + merge keep book fields and reading order', () => {
+  const a = parseTranscript('WEBVTT\n\nc01-p0001-s01\n00:00:05.000 --> 00:00:06.000\nA <00:00:05.500>b\n\nc01-p0001-s02\n00:00:00.000 --> 00:00:00.000\n<c.unspoken>u</c>\n').cues
+  const b = parseTranscript('WEBVTT\n\nc02-p0001-s01\n00:00:01.000 --> 00:00:02.000\nc\n').cues
+  const merged = mergeCues([offsetCues(a, 0), offsetCues(b, 100)])
+  assert.deepEqual(
+    merged.map((c) => c.id),
+    ['c01-p0001-s01', 'c01-p0001-s02', 'c02-p0001-s01']
+  )
+  assert.equal(offsetCues(a, 10)[0].words[1].t, 15.5)
+  assert.equal(offsetCues(a, 10)[1].spoken, false)
+  assert.equal(offsetCues(b, 100)[0].chapter, 2)
+})
+
+test('search works on plain text, across unspoken words and line breaks', () => {
+  const { cues } = parseTranscript(readFileSync(new URL('./fixtures/book-contract.vtt', import.meta.url), 'utf8'))
+  const hit = (q) => searchCues(cues, q).map((i) => cues[i].id)
+  assert.deepEqual(hit('said the postman'), ['c01-p0001-s03']) // unspoken words are searchable
+  assert.deepEqual(hit('one the lantern'), ['c01-h']) // the heading's newline matches a space
+  assert.deepEqual(hit('GULL ROCK'), ['c01-p0001-s01']) // across markup
+})
+
+test('a one-word spoken sentence without inline timestamps is still one highlightable word', () => {
+  const r = cue('“No.” <c.unspoken>said Tom.</c>', 7)
+  assert.equal(r.spoken, true)
+  assert.deepEqual(
+    r.words.map((w) => [w.t, w.w.trim()]),
+    [[7, '“No.”']]
+  )
+  assert.equal(r.segs.find((s) => s.k === 0).w, '“No.” ')
+  // also when an unspoken prefix comes first: the word still starts at the cue start
+  const p = cue('<c.unspoken>Tom said,</c> “Go.”', 9)
+  assert.deepEqual(
+    p.words.map((w) => [w.t, w.w]),
+    [[9, ' “Go.”']]
+  )
+  // legacy cues without timestamps are unchanged
+  assert.equal(parseCuePayload('plain text', 1).words, null)
+  // from the file
+  const { cues } = parseTranscript(readFileSync(new URL('./fixtures/book-contract.vtt', import.meta.url), 'utf8'))
+  const why = cues.find((c) => c.id === 'c01-p0002-s03')
+  assert.equal(why.words.length, 1)
+  assert.equal(why.words[0].t, 23.3)
+  assert.equal(findWordIndex(why, 23.4), 0)
 })

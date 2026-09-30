@@ -6,6 +6,10 @@
         <p class="tr-chapter truncate">{{ headerChapter || $strings.LabelTranscript }}</p>
         <p class="tr-sub truncate">
           <span class="font-mono">{{ headerClock }}</span>
+          <template v-if="duration > 0"
+            ><span class="tr-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="Math.round(progressFraction * 100)"><span class="tr-progress-fill" :style="{ width: progressFraction * 100 + '%' }"></span></span
+            ><span class="font-mono">-{{ remainingClock }}</span></template
+          >
           <span v-if="!following" class="tr-pill">{{ $strings.LabelTranscriptFollow }}</span>
           <span v-if="searchOpen && query" class="ml-2">{{ matches.length ? `${matchPos + 1}/${matches.length}` : $strings.MessageTranscriptNoResults }}</span>
         </p>
@@ -19,7 +23,7 @@
       <input ref="searchInput" v-model="query" type="search" class="tr-search" :placeholder="$strings.LabelTranscriptSearchPlaceholder" enterkeyhint="search" autocomplete="off" @input="scheduleSearch" @focus="searchFocused = true" @blur="searchFocused = false" @click.stop />
     </div>
 
-    <!-- Body: windowed cue list, the centre cue is positioned with a transform (no scrolling container) -->
+    <!-- Body: windowed list of blocks (paragraphs), the current line is positioned with a transform (no scrolling container) -->
     <div ref="body" class="tr-body relative flex-1 overflow-hidden">
       <div v-if="status === 'loading'" class="absolute inset-0 flex flex-col items-center justify-center text-fg-muted">
         <widgets-spinner-icon class="h-10 w-10 mb-3" />
@@ -29,12 +33,7 @@
         <p>{{ $strings.MessageTranscriptFailed }}</p>
       </div>
       <div v-else ref="track" class="tr-track absolute left-0 right-0 top-0 px-6" :style="{ fontSize: fontPx + 'px' }">
-        <p v-for="i in windowIndices" :key="i" :data-i="i" class="tr-cue" :class="cueClass(i)" @click.stop="onCueClick(i)">
-          <template v-if="i === activeIdx && cues[i].words"
-            ><span v-for="(w, wi) in cues[i].words" :key="wi" class="tr-word" :class="{ 'tr-word-done': wi < wordIdx, 'tr-word-now': wi === wordIdx }">{{ w.w }}</span></template
-          >
-          <template v-else>{{ cues[i].text }}</template>
-        </p>
+        <app-transcript-block v-for="b in windowIndices" :key="b" :cues="cues" :block="blocks[b]" :index="b" :active-cue="b === activeBlock ? activeIdx : -1" :word-idx="b === activeBlock ? wordIdx : -1" :selected="zone === 'list' && !following && b === selectedBlock" :match-set="searchOpen ? matchSet : null" @pick="onPick" />
       </div>
     </div>
 
@@ -43,15 +42,13 @@
 </template>
 
 <script>
-import { findCueIndex, findWordIndex, searchCues, formatClock } from '@/utils/transcript'
+import { findCueIndex, findWordIndex, searchCues, formatClock, buildBlocks, seekTimeForCue } from '@/utils/transcript'
 import { loadTranscript } from '@/utils/transcriptLoader'
 
 const FONT_SCALES = [0.8, 1, 1.25, 1.5, 1.8]
 const FONT_STORAGE_KEY = 'absTranscriptFontLevel'
-const WINDOW_BEFORE = 30
-const WINDOW_AFTER = 50
-const WINDOW_MARGIN = 12
-const JUMP_CUES = 10
+// Window sizes in blocks: a book paragraph holds several sentences, a legacy block is a single cue
+const WINDOW = { book: { before: 12, after: 24, margin: 6 }, legacy: { before: 30, after: 50, margin: 12 } }
 // After a seek, ignore player position updates that still report the old position
 const SEEK_HOLD_MS = 1500
 
@@ -64,6 +61,8 @@ export default {
     isPlaying: Boolean,
     playbackRate: { type: Number, default: 1 },
     chapters: { type: Array, default: () => [] },
+    // Total book duration in seconds (0 = unknown, hides the progress bar)
+    duration: { type: Number, default: 0 },
     coverColor: { type: String, default: 'rgb(55, 56, 56)' }
   },
   data() {
@@ -71,13 +70,16 @@ export default {
       status: 'loading', // loading | ready | error
       progress: 0,
       cues: [],
+      blocks: [],
+      blockOf: null,
+      book: false,
       hasWords: false,
       zone: 'list', // list | header
       headerIdx: 0,
       following: true,
       activeIdx: -1,
       wordIdx: -1,
-      selectedIdx: 0,
+      selectedBlock: 0,
       winStart: 0,
       winEnd: 0,
       fontLevel: 1,
@@ -98,9 +100,16 @@ export default {
       const base = this.isTv ? Math.max(18, Math.round(h * 0.04)) : Math.max(16, Math.min(22, Math.round(h * 0.028)))
       return Math.round(base * FONT_SCALES[this.fontLevel])
     },
-    centerIdx() {
-      if (this.following) return Math.max(this.activeIdx, 0)
-      return this.selectedIdx
+    win() {
+      return this.book ? WINDOW.book : WINDOW.legacy
+    },
+    // Block that holds the current sentence (-1 before the first spoken cue)
+    activeBlock() {
+      return this.blockOf && this.activeIdx >= 0 ? this.blockOf[this.activeIdx] : -1
+    },
+    centerBlock() {
+      if (this.following) return Math.max(this.activeBlock, 0)
+      return this.selectedBlock
     },
     windowIndices() {
       const out = []
@@ -111,21 +120,38 @@ export default {
       return new Set(this.matches)
     },
     headerButtons() {
-      return [
+      const buttons = [
         { id: 'play', icon: this.isPlaying ? 'pause' : 'play_arrow', label: this.$strings.LabelTranscriptPlayPause, action: () => this.$emit('toggle-play') },
         { id: 'follow', icon: 'my_location', label: this.$strings.LabelTranscriptFollow, disabled: this.following, action: () => this.resumeFollow() },
         { id: 'smaller', icon: 'text_decrease', label: this.$strings.LabelTranscriptFontSmaller, disabled: this.fontLevel === 0, action: () => this.changeFont(-1) },
         { id: 'larger', icon: 'text_increase', label: this.$strings.LabelTranscriptFontLarger, disabled: this.fontLevel === FONT_SCALES.length - 1, action: () => this.changeFont(1) },
-        { id: 'search', icon: 'search', label: this.$strings.LabelTranscriptSearch, action: () => this.toggleSearch() },
-        { id: 'close', icon: 'close', label: this.$strings.ButtonClose, action: () => this.$emit('close') }
+        { id: 'search', icon: 'search', label: this.$strings.LabelTranscriptSearch, action: () => this.toggleSearch() }
       ]
+      // Result navigation is a pair of header buttons so it stays reachable with the D-pad
+      if (this.searchOpen && this.matches.length) {
+        buttons.push({ id: 'prev-match', icon: 'keyboard_arrow_up', label: this.$strings.LabelTranscriptPrevMatch, action: () => this.gotoMatch(this.matchPos - 1) })
+        buttons.push({ id: 'next-match', icon: 'keyboard_arrow_down', label: this.$strings.LabelTranscriptNextMatch, action: () => this.gotoMatch(this.matchPos + 1) })
+      }
+      buttons.push({ id: 'close', icon: 'close', label: this.$strings.ButtonClose, action: () => this.$emit('close') })
+      return buttons
     },
+    // Book time of the row shown in the header: the playback position while following, else the browsed block
     headerTime() {
-      const cue = this.cues[this.centerIdx]
+      if (this.following || !this.blocks.length) return this.currentTime
+      const b = this.blocks[this.centerBlock]
+      if (!b) return this.currentTime
+      const cue = this.cues[b.firstSpoken >= 0 ? b.firstSpoken : b.first]
       return cue ? cue.start : this.currentTime
     },
     headerClock() {
       return formatClock(this.headerTime)
+    },
+    progressFraction() {
+      return this.duration > 0 ? Math.min(1, Math.max(0, this.headerTime / this.duration)) : 0
+    },
+    // Same arithmetic as the player's own "remaining" readout: book time left divided by the playback speed
+    remainingClock() {
+      return formatClock(Math.max(0, this.duration - this.headerTime) / (this.playbackRate || 1))
     },
     headerChapter() {
       const t = this.headerTime
@@ -142,15 +168,28 @@ export default {
       if (!playing) this.anchorT = this.interpolate()
       this.anchorAt = performance.now()
     },
-    centerIdx() {
+    centerBlock() {
       this.ensureWindow()
-      this.$nextTick(() => this.applyTransform(true))
+      this.scheduleTransform(true)
+    },
+    // While following, keep the line being read at a fixed height (typewriter style)
+    wordIdx() {
+      if (this.following) this.scheduleTransform(true)
+    },
+    activeIdx() {
+      if (this.following) this.scheduleTransform(true)
+    },
+    following() {
+      this.scheduleTransform(true)
     },
     fontPx() {
-      this.$nextTick(() => this.applyTransform(false))
+      this.scheduleTransform(false)
     },
     viewportHeight() {
-      this.$nextTick(() => this.applyTransform(false))
+      this.scheduleTransform(false)
+    },
+    headerButtons(list) {
+      if (this.headerIdx >= list.length) this.headerIdx = list.length - 1
     }
   },
   created() {
@@ -163,6 +202,8 @@ export default {
     this.lastBackAt = 0
     this.searchTimer = null
     this.tickTimer = null
+    this.transformQueued = false
+    this.transformAnimate = false
     this.touchY = null
     this.touchAcc = 0
     try {
@@ -196,13 +237,17 @@ export default {
     async load() {
       try {
         const result = await loadTranscript(this.$nativeHttp, this.libraryItemId, this.sources, (p) => (this.progress = p))
+        const layout = buildBlocks(result.cues)
         this.cues = Object.freeze(result.cues)
+        this.blocks = Object.freeze(layout.blocks)
+        this.blockOf = layout.blockOf
+        this.book = layout.book
         this.hasWords = result.hasWords
         this.status = 'ready'
         this.tick()
-        this.selectedIdx = Math.max(this.activeIdx, 0)
+        this.selectedBlock = Math.max(this.activeBlock, 0)
         this.ensureWindow()
-        this.$nextTick(() => this.applyTransform(false))
+        this.scheduleTransform(false)
         this.tickTimer = setInterval(this.tick, 100)
       } catch (error) {
         console.error('[transcript] load failed', error)
@@ -213,7 +258,9 @@ export default {
     // ---- playback clock ----
     syncClock(val) {
       const now = performance.now()
-      if (now < this.seekHoldUntil && Math.abs(val - this.seekTarget) > 2) return
+      // Right after a seek the player may still report the old position or a position a little before the
+      // target (position updates are ~1 Hz); taking it would flash the previous sentence, so ignore those
+      if (now < this.seekHoldUntil && (val < this.seekTarget - 0.05 || Math.abs(val - this.seekTarget) > 2)) return
       this.anchorT = val
       this.anchorAt = now
     },
@@ -226,32 +273,64 @@ export default {
     tick() {
       if (!this.cues.length) return
       const t = this.estimateTime()
+      // Only cues with spoken words can be current; fully unspoken cues are skipped by the lookup
       const idx = findCueIndex(this.cues, t)
       if (idx !== this.activeIdx) this.activeIdx = idx
       const w = idx >= 0 && this.cues[idx].words ? findWordIndex(this.cues[idx], t) : -1
       if (w !== this.wordIdx) this.wordIdx = w
-      if (this.following && idx >= 0 && this.selectedIdx !== idx) this.selectedIdx = idx
+      if (this.following && idx >= 0 && this.selectedBlock !== this.blockOf[idx]) this.selectedBlock = this.blockOf[idx]
     },
 
     // ---- windowing / positioning ----
     ensureWindow() {
-      const n = this.cues.length
+      const n = this.blocks.length
       if (!n) return
-      const c = this.centerIdx
-      const needs = this.winEnd === 0 || (c < this.winStart + WINDOW_MARGIN && this.winStart > 0) || (c > this.winEnd - WINDOW_MARGIN && this.winEnd < n) || c < this.winStart || c >= this.winEnd
+      const c = this.centerBlock
+      const { before, after, margin } = this.win
+      const needs = this.winEnd === 0 || (c < this.winStart + margin && this.winStart > 0) || (c > this.winEnd - margin && this.winEnd < n) || c < this.winStart || c >= this.winEnd
       if (!needs) return
-      this.winStart = Math.max(0, c - WINDOW_BEFORE)
-      this.winEnd = Math.min(n, c + WINDOW_AFTER)
+      this.winStart = Math.max(0, c - before)
+      this.winEnd = Math.min(n, c + after)
       this.rebased = true // DOM above the centre changes: reposition without animating
+    },
+    scheduleTransform(animate) {
+      this.transformAnimate = this.transformAnimate || animate
+      if (this.transformQueued) return
+      this.transformQueued = true
+      this.$nextTick(() => {
+        this.transformQueued = false
+        const a = this.transformAnimate
+        this.transformAnimate = false
+        this.applyTransform(a)
+      })
     },
     applyTransform(animate) {
       const track = this.$refs.track
       const body = this.$refs.body
       if (!track || !body) return
-      const el = track.querySelector(`[data-i="${this.centerIdx}"]`)
-      if (!el) return
-      const y = el.offsetTop + el.offsetHeight / 2
-      const ty = Math.round(body.clientHeight * 0.42 - y)
+      const blockEl = track.querySelector(`[data-b="${this.centerBlock}"]`)
+      if (!blockEl) return
+      const bodyH = body.clientHeight
+      const trackTop = track.getBoundingClientRect().top
+      // Rect of an element relative to the (possibly mid-transition) track
+      const relRect = (el) => {
+        const r = el.getClientRects()[0] || el.getBoundingClientRect()
+        return { top: r.top - trackTop, height: r.height }
+      }
+      let ty
+      let lineEl = null
+      if (this.following && this.activeBlock === this.centerBlock) {
+        // Follow the line being read: the current word, else the current sentence
+        lineEl = track.querySelector('.tr-word-now') || track.querySelector(`[data-c="${this.activeIdx}"]`)
+      }
+      if (lineEl) {
+        const r = relRect(lineEl)
+        ty = Math.round(bodyH * 0.42 - (r.top + r.height / 2))
+      } else {
+        const r = relRect(blockEl)
+        // A paragraph taller than the screen is aligned by its top edge so its start stays visible
+        ty = r.height > bodyH * 0.7 ? Math.round(bodyH * 0.15 - r.top) : Math.round(bodyH * 0.42 - (r.top + r.height / 2))
+      }
       track.style.transition = animate && !this.rebased ? 'transform 180ms ease-out' : 'none'
       track.style.transform = `translate3d(0, ${ty}px, 0)`
       this.rebased = false
@@ -259,43 +338,48 @@ export default {
     onResize() {
       this.viewportHeight = window.innerHeight
     },
-    cueClass(i) {
-      return {
-        'tr-active': i === this.activeIdx,
-        'tr-selected': this.zone === 'list' && !this.following && i === this.selectedIdx,
-        'tr-match': this.searchOpen && this.matchSet.has(i)
-      }
+    centerBlockHeight() {
+      const track = this.$refs.track
+      const el = track && track.querySelector(`[data-b="${this.centerBlock}"]`)
+      return el ? el.offsetHeight : 0
     },
 
     // ---- actions ----
-    browse(idx) {
-      const n = this.cues.length
+    browse(blockIdx) {
+      const n = this.blocks.length
       if (!n) return
       this.following = false
-      this.selectedIdx = Math.min(n - 1, Math.max(0, idx))
+      this.selectedBlock = Math.min(n - 1, Math.max(0, blockIdx))
     },
     resumeFollow() {
       this.following = true
-      this.selectedIdx = Math.max(this.activeIdx, 0)
+      this.selectedBlock = Math.max(this.activeBlock, 0)
       this.zone = 'list'
     },
-    seekToCue(i) {
-      const cue = this.cues[i]
-      if (!cue) return
-      const t = cue.start
+    seekToTime(t) {
+      if (t < 0) return
       this.anchorT = t
       this.anchorAt = performance.now()
       this.seekTarget = t
       this.seekHoldUntil = performance.now() + SEEK_HOLD_MS
       this.$emit('seek', t)
-      this.activeIdx = i
-      this.wordIdx = cue.words ? 0 : -1
+      const idx = findCueIndex(this.cues, t)
+      this.activeIdx = idx
+      this.wordIdx = idx >= 0 && this.cues[idx].words ? findWordIndex(this.cues[idx], t) : -1
       this.following = true
-      this.selectedIdx = i
+      this.selectedBlock = Math.max(idx >= 0 ? this.blockOf[idx] : 0, 0)
       this.zone = 'list'
     },
-    onCueClick(i) {
-      this.seekToCue(i)
+    // Seek to the first spoken word of a cue / block
+    seekToCue(i) {
+      this.seekToTime(seekTimeForCue(this.cues, i))
+    },
+    seekToBlock(b) {
+      const blk = this.blocks[b]
+      if (blk) this.seekToCue(blk.firstSpoken >= 0 ? blk.firstSpoken : blk.first)
+    },
+    onPick(ci) {
+      this.seekToCue(ci)
     },
     changeFont(delta) {
       const next = Math.min(FONT_SCALES.length - 1, Math.max(0, this.fontLevel + delta))
@@ -321,6 +405,10 @@ export default {
       this.$nextTick(() => this.$refs.searchInput && this.$refs.searchInput.focus())
     },
     closeSearch() {
+      // The result buttons disappear with the search: keep the header focus on the search button
+      // instead of letting it clamp onto Close
+      const at = this.headerButtons.findIndex((b) => b.id === 'search')
+      if (this.zone === 'header' && this.headerIdx > at) this.headerIdx = at
       this.searchOpen = false
       this.searchFocused = false
       this.query = ''
@@ -338,15 +426,16 @@ export default {
         this.matchPos = -1
         return
       }
-      // First match at or after the current position
-      let pos = this.matches.findIndex((m) => m >= this.centerIdx)
+      // First match at or after the current block
+      const from = this.blocks[this.centerBlock] ? this.blocks[this.centerBlock].first : 0
+      let pos = this.matches.findIndex((m) => m >= from)
       if (pos < 0) pos = 0
       this.gotoMatch(pos)
     },
     gotoMatch(pos) {
       if (!this.matches.length) return
       this.matchPos = (pos + this.matches.length) % this.matches.length
-      this.browse(this.matches[this.matchPos])
+      this.browse(this.blockOf[this.matches[this.matchPos]])
     },
 
     // ---- input ----
@@ -355,6 +444,10 @@ export default {
       if (now - this.lastBackAt < 250) return
       this.lastBackAt = now
       if (this.searchOpen) return this.closeSearch()
+      if (this.zone === 'header') {
+        this.zone = 'list'
+        return
+      }
       if (!this.following) return this.resumeFollow()
       this.$emit('close')
     },
@@ -362,6 +455,18 @@ export default {
       e.preventDefault()
       e.stopImmediatePropagation()
     },
+    /*
+     * Key map (Android TV remote):
+     *   text    Up / Down      previous / next paragraph (Up on the first one moves to the header)
+     *           Left / Right   move focus to the header button row
+     *           OK             following: play / pause, browsing: play from the focused paragraph
+     *   header  Left / Right   previous / next button
+     *           OK             activate the focused button
+     *           Down           back to the text (or into the search field when search is open)
+     *   search  typing, OK runs the search; Down = text, Up = header; result navigation = the
+     *           up / down arrow buttons that appear in the header while there are matches
+     *   Back    closes search, then leaves the header row, then resumes following, then closes the view
+     */
     onKeyDown(e) {
       const k = e.key
       const isBack = k === 'Escape' || k === 'GoBack' || e.keyCode === 4
@@ -399,28 +504,29 @@ export default {
       if (this.zone === 'header') {
         if (k === 'ArrowLeft') this.headerIdx = Math.max(0, this.headerIdx - 1)
         else if (k === 'ArrowRight') this.headerIdx = Math.min(this.headerButtons.length - 1, this.headerIdx + 1)
-        else if (k === 'ArrowDown') this.zone = 'list'
-        else if (k === 'Enter') this.activateButton(this.headerIdx)
+        else if (k === 'ArrowDown') {
+          // With results on screen go straight to the text (focusing the field would pop the TV keyboard)
+          if (this.searchOpen && !this.query && this.$refs.searchInput) this.$refs.searchInput.focus()
+          else this.zone = 'list'
+        } else if (k === 'Enter') this.activateButton(this.headerIdx)
         return
       }
 
-      // list zone
-      if (k === 'ArrowDown') this.browse(this.centerIdx + 1)
+      // text zone
+      if (k === 'ArrowDown') this.browse(this.centerBlock + 1)
       else if (k === 'ArrowUp') {
-        if (this.centerIdx <= 0) this.zone = 'header'
-        else this.browse(this.centerIdx - 1)
+        if (this.centerBlock <= 0) this.zone = 'header'
+        else this.browse(this.centerBlock - 1)
       } else if (k === 'ArrowLeft' || k === 'ArrowRight') {
-        const dir = k === 'ArrowRight' ? 1 : -1
-        if (this.searchOpen && this.matches.length) this.gotoMatch(this.matchPos + dir)
-        else this.browse(this.centerIdx + dir * JUMP_CUES)
+        this.zone = 'header'
       } else if (k === 'Enter') {
         if (this.following) this.$emit('toggle-play')
-        else this.seekToCue(this.selectedIdx)
+        else this.seekToBlock(this.selectedBlock)
       }
     },
     onWheel(e) {
       if (this.status !== 'ready') return
-      this.browse(this.centerIdx + (e.deltaY > 0 ? 1 : -1))
+      this.browse(this.centerBlock + (e.deltaY > 0 ? 1 : -1))
     },
     onTouchStart(e) {
       this.touchY = e.touches[0].clientY
@@ -431,10 +537,14 @@ export default {
       const y = e.touches[0].clientY
       this.touchAcc += this.touchY - y
       this.touchY = y
-      const step = this.fontPx * 2.5
-      while (Math.abs(this.touchAcc) >= step) {
+      // One step per block, so the distance to drag is about the height of a paragraph
+      const bodyH = (this.$refs.body && this.$refs.body.clientHeight) || 600
+      let guard = 0
+      for (;;) {
+        const step = Math.min(Math.max(this.centerBlockHeight(), this.fontPx * 2.5), bodyH * 0.5)
+        if (Math.abs(this.touchAcc) < step || ++guard > 20) break
         const dir = this.touchAcc > 0 ? 1 : -1
-        this.browse(this.centerIdx + dir)
+        this.browse(this.centerBlock + dir)
         this.touchAcc -= dir * step
       }
     }
@@ -455,6 +565,31 @@ export default {
 .tr-sub {
   font-size: 0.8rem;
   opacity: 0.7;
+}
+.tr-progress {
+  display: inline-block;
+  width: 14em;
+  max-width: 28%;
+  height: 0.35em;
+  margin: 0 0.4em;
+  vertical-align: middle;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.25);
+  overflow: hidden;
+}
+@media (max-width: 480px) {
+  /* the header buttons leave very little room on a phone: keep the two clocks, drop the bar */
+  .tr-progress {
+    display: none;
+  }
+  .tr-progress + .font-mono {
+    margin-left: 0.5em;
+  }
+}
+.tr-progress-fill {
+  display: block;
+  height: 100%;
+  background: var(--tv-focus-color, #1ad691);
 }
 .tr-pill {
   margin-left: 0.5rem;
@@ -496,37 +631,6 @@ export default {
 }
 .tr-track {
   will-change: transform;
-}
-.tr-cue {
-  margin: 0;
-  padding: 0.35em 0.6em;
-  line-height: 1.4;
-  opacity: 0.45;
-  border-left: 0.2em solid transparent;
-  border-radius: 0.2em;
-  overflow-wrap: anywhere;
-}
-.tr-active {
-  opacity: 1;
-}
-.tr-selected {
-  opacity: 0.95;
-  border-left-color: var(--tv-focus-color, #1ad691);
-  background: rgba(255, 255, 255, 0.08);
-}
-.tr-match {
-  text-decoration: underline;
-  text-decoration-color: rgba(255, 213, 79, 0.9);
-}
-.tr-word {
-  opacity: 0.55;
-}
-.tr-word-done {
-  opacity: 1;
-}
-.tr-word-now {
-  opacity: 1;
-  color: var(--tv-focus-color, #1ad691);
 }
 .tr-hint {
   font-size: 0.75rem;

@@ -107,7 +107,7 @@
       </div>
     </div>
 
-    <app-transcript-view v-if="showTranscript && showFullscreen && hasTranscript" :library-item-id="transcriptItemId" :sources="transcriptSources" :current-time="currentTime" :is-playing="isPlaying" :playback-rate="currentPlaybackRate" :chapters="chapters" :cover-color="coverRgb" @seek="seek" @toggle-play="playPauseClick" @close="closeTranscript" />
+    <app-transcript-view v-if="showTranscript && showFullscreen && hasTranscript" :library-item-id="transcriptItemId" :sources="transcriptSources" :current-time="currentTime" :is-playing="isPlaying" :playback-rate="currentPlaybackRate" :chapters="chapters" :duration="totalDuration" :cover-color="coverRgb" @seek="seek" @toggle-play="playPauseClick" @close="closeTranscript" />
 
     <modals-chapters-modal v-model="showChapterModal" :current-chapter="currentChapter" :chapters="chapters" :playback-rate="currentPlaybackRate" @select="selectChapter" />
     <modals-dialog v-model="showMoreMenuDialog" :items="menuItems" width="80vw" @action="clickMenuAction" />
