@@ -102,7 +102,7 @@ ${nightCss(activeClass)}`
 /**
  * Night mode: light text on black, switched by the `abs-night` class on <html> so that toggling needs no rebuild. The book's
  * colours are overridden (including -webkit-text-fill-color, which iBooks exports like to set); illustrations are not
- * touched. The active word becomes a solid amber block with black text: light text on a translucent amber would be weak.
+ * touched (pictures with transparency get a light backdrop, so dark line art does not vanish on black). The active word becomes a solid amber block with black text: light text on a translucent amber would be weak.
  */
 export function nightCss(activeClass) {
   const act = `[class~="${activeClass}"]`
@@ -118,6 +118,7 @@ html.abs-night body .abs-dropcap-letter,html.abs-night body .abs-dropcap-letter 
 html.abs-night body span${act}{background-color:#ffc400!important;box-shadow:0 0 0 .09em #ffc400;color:#000!important;-webkit-text-fill-color:#000!important}
 html.abs-night body span${act}::first-letter{color:#000!important;-webkit-text-fill-color:#000!important}
 html.abs-night body span.abs-find{background-color:#1ad691!important;color:#000!important;-webkit-text-fill-color:#000!important}
+html.abs-night body img{background-color:#e9e6dc!important}
 html.abs-night body .abs-widget .abs-w-badge{background-color:rgba(0,0,0,.55)!important;color:#fff!important;-webkit-text-fill-color:#fff!important}
 html.abs-night body .abs-widget iframe.abs-w-live{background-color:#fff!important}
 `

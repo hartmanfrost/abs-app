@@ -883,6 +883,9 @@ export default {
       if (it.kind === 'widget' && it.spec) return this.openWidgetSpec(it.spec, it.src)
       const w = it.w > 0 ? it.w : 1000
       const h = it.h > 0 ? it.h : Math.round(w / (it.aspect || 4 / 3))
+      // Same as a widget: the audiobook pauses while the illustration is open and resumes on Back
+      this.wasPlayingBeforeWidget = this.isPlaying
+      if (this.isPlaying) this.$emit('toggle-play')
       this.widgetOpen = { index: -1, w, h, src: '', thumb: it.src, still: true }
       this.$nextTick(() => this.$refs.root && this.$refs.root.focus({ preventScroll: true }))
     },
@@ -1317,10 +1320,10 @@ export default {
      *           Left / Right   wide layout: towards the illustration pane (Right; Left when the panes are swapped) focuses the pane,
      *                          the other one the header button row; narrow layout: both go to the header row
      *           OK             following: play / pause; browsing: play from the paragraph / open the widget
-     *   pane    OK             open the illustration / widget full screen (a widget pauses the audiobook)
+     *   pane    OK             open the illustration / widget full screen (the audiobook pauses)
      *           Down / Back / the key pointing at the text  return to the text; Up / the key pointing away  move to the header
      *   header  Left / Right   previous / next button, OK activates, Down returns to the text
-     *   widget  arrows move a pointer, OK taps, Back closes and resumes the audiobook (a plain picture: OK or Back closes)
+     *   widget  arrows move a pointer, OK taps, Back closes and resumes the audiobook (a plain picture: OK or Back closes; it pauses the audiobook too)
      */
     onKeyDown(e) {
       const k = e.key
@@ -1568,7 +1571,8 @@ export default {
   border-left-color: #333;
 }
 .bk-night .bk-pane-box {
-  background: #111;
+  /* light backdrop: a picture with transparency (dark line art) must not vanish on black; opaque pictures cover it */
+  background: #e9e6dc;
   box-shadow: 0 0 0 1px #333;
 }
 .bk-night .bk-pane-empty {
