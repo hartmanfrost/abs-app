@@ -44,15 +44,16 @@
 <script>
 import { findCueIndex, findWordIndex, searchCues, formatClock, buildBlocks, seekTimeForCue } from '@/utils/transcript'
 import { loadTranscript } from '@/utils/transcriptLoader'
+import playbackClock from '@/mixins/playbackClock'
+import { enterReader, leaveReader } from '@/utils/readerFlag'
 
 const FONT_SCALES = [0.8, 1, 1.25, 1.5, 1.8]
 const FONT_STORAGE_KEY = 'absTranscriptFontLevel'
 // Window sizes in blocks: a book paragraph holds several sentences, a legacy block is a single cue
 const WINDOW = { book: { before: 12, after: 24, margin: 6 }, legacy: { before: 30, after: 50, margin: 12 } }
-// After a seek, ignore player position updates that still report the old position
-const SEEK_HOLD_MS = 1500
 
 export default {
+  mixins: [playbackClock],
   props: {
     libraryItemId: { type: String, required: true },
     // [{ ino, offset, signature }] from fetchTranscriptSources
@@ -63,7 +64,9 @@ export default {
     chapters: { type: Array, default: () => [] },
     // Total book duration in seconds (0 = unknown, hides the progress bar)
     duration: { type: Number, default: 0 },
-    coverColor: { type: String, default: 'rgb(55, 56, 56)' }
+    coverColor: { type: String, default: 'rgb(55, 56, 56)' },
+    // A synced EPUB exists too: show a header button that switches to the book view
+    canSwitchMode: Boolean
   },
   data() {
     return {
@@ -132,6 +135,61 @@ export default {
         buttons.push({ id: 'prev-match', icon: 'keyboard_arrow_up', label: this.$strings.LabelTranscriptPrevMatch, action: () => this.gotoMatch(this.matchPos - 1) })
         buttons.push({ id: 'next-match', icon: 'keyboard_arrow_down', label: this.$strings.LabelTranscriptNextMatch, action: () => this.gotoMatch(this.matchPos + 1) })
       }
+      if (this.canSwitchMode) buttons.push({ id: 'mode', icon: 'menu_book', label: this.$strings.LabelReaderBook, action: () => this.$emit('switch-mode') })
+      buttons.push({ id: 'close', icon: 'close', label: this.$strings.ButtonClose, action: () => this.$emit('close') })
+      return buttons
+    },
+    // Book time of the row shown in the header: the playback position while following, else the browsed block
+    headerTime() {
+      if (this.following || !this.blocks.length) return this.currentTime
+      const b = this.blocks[this.centerBlock]
+      if (!b) return this.currentTime
+      const cue = this.cues[b.firstSpoken >= 0 ? b.firstSpoken : b.first]
+      return cue ? cue.start : this.currentTime
+    },
+    headerClock() {
+      return formatClock(this.headerTime)
+    },
+    progressFraction() {
+      return this.duration > 0 ? Math.min(1, Math.max(0, this.headerTime / this.duration)) : 0
+    },
+    // Same arithmetic as the player's own "remaining" readout: book time left divided by the playback speed
+    remainingClock() {
+      return formatClock(Math.max(0, this.duration - this.headerTime) / (this.playbackRate || 1))
+    },
+    headerChapter() {
+      const t = this.headerTime
+      const ch = this.chapters.find((c) => Number(c.start) <= t && Number(c.end) > t)
+      return ch ? ch.title : ''
+    }
+  },
+  watch: {
+    centerBlock() {
+      if (this.following) return Math.max(this.activeBlock, 0)
+      return this.selectedBlock
+    },
+    windowIndices() {
+      const out = []
+      for (let i = this.winStart; i < this.winEnd; i++) out.push(i)
+      return out
+    },
+    matchSet() {
+      return new Set(this.matches)
+    },
+    headerButtons() {
+      const buttons = [
+        { id: 'play', icon: this.isPlaying ? 'pause' : 'play_arrow', label: this.$strings.LabelTranscriptPlayPause, action: () => this.$emit('toggle-play') },
+        { id: 'follow', icon: 'my_location', label: this.$strings.LabelTranscriptFollow, disabled: this.following, action: () => this.resumeFollow() },
+        { id: 'smaller', icon: 'text_decrease', label: this.$strings.LabelTranscriptFontSmaller, disabled: this.fontLevel === 0, action: () => this.changeFont(-1) },
+        { id: 'larger', icon: 'text_increase', label: this.$strings.LabelTranscriptFontLarger, disabled: this.fontLevel === FONT_SCALES.length - 1, action: () => this.changeFont(1) },
+        { id: 'search', icon: 'search', label: this.$strings.LabelTranscriptSearch, action: () => this.toggleSearch() }
+      ]
+      // Result navigation is a pair of header buttons so it stays reachable with the D-pad
+      if (this.searchOpen && this.matches.length) {
+        buttons.push({ id: 'prev-match', icon: 'keyboard_arrow_up', label: this.$strings.LabelTranscriptPrevMatch, action: () => this.gotoMatch(this.matchPos - 1) })
+        buttons.push({ id: 'next-match', icon: 'keyboard_arrow_down', label: this.$strings.LabelTranscriptNextMatch, action: () => this.gotoMatch(this.matchPos + 1) })
+      }
+      if (this.canSwitchMode) buttons.push({ id: 'mode', icon: 'menu_book', label: this.$strings.LabelReaderBook, action: () => this.$emit('switch-mode') })
       buttons.push({ id: 'close', icon: 'close', label: this.$strings.ButtonClose, action: () => this.$emit('close') })
       return buttons
     },
@@ -193,11 +251,6 @@ export default {
     }
   },
   created() {
-    // Non-reactive playback clock (interpolated between the player's 1 Hz position updates)
-    this.anchorT = this.currentTime
-    this.anchorAt = performance.now()
-    this.seekHoldUntil = 0
-    this.seekTarget = 0
     this.rebased = true
     this.lastBackAt = 0
     this.searchTimer = null
@@ -218,7 +271,7 @@ export default {
     window.addEventListener('keydown', this.onKeyDown, true)
     window.addEventListener('resize', this.onResize)
     this.$eventBus.$on('transcript-back', this.back)
-    this.$store.commit('setTranscriptOpen', true)
+    enterReader(this.$store)
     this.$refs.root && this.$refs.root.focus({ preventScroll: true })
     this.load()
   },
@@ -228,10 +281,7 @@ export default {
     this.$eventBus.$off('transcript-back', this.back)
     clearInterval(this.tickTimer)
     clearTimeout(this.searchTimer)
-    // Keep the flag up briefly: a hardware Back press can deliver both a DOM key event and the native
-    // backButton event, and the second one must not fall through to the player.
-    const store = this.$store
-    setTimeout(() => store.commit('setTranscriptOpen', false), 400)
+    leaveReader(this.$store)
   },
   methods: {
     async load() {
@@ -255,21 +305,7 @@ export default {
       }
     },
 
-    // ---- playback clock ----
-    syncClock(val) {
-      const now = performance.now()
-      // Right after a seek the player may still report the old position or a position a little before the
-      // target (position updates are ~1 Hz); taking it would flash the previous sentence, so ignore those
-      if (now < this.seekHoldUntil && (val < this.seekTarget - 0.05 || Math.abs(val - this.seekTarget) > 2)) return
-      this.anchorT = val
-      this.anchorAt = now
-    },
-    interpolate() {
-      return this.anchorT + ((performance.now() - this.anchorAt) / 1000) * (this.playbackRate || 1)
-    },
-    estimateTime() {
-      return this.isPlaying ? this.interpolate() : this.anchorT
-    },
+    // ---- playback clock (see mixins/playbackClock.js) ----
     tick() {
       if (!this.cues.length) return
       const t = this.estimateTime()
@@ -358,10 +394,7 @@ export default {
     },
     seekToTime(t) {
       if (t < 0) return
-      this.anchorT = t
-      this.anchorAt = performance.now()
-      this.seekTarget = t
-      this.seekHoldUntil = performance.now() + SEEK_HOLD_MS
+      this.markSeek(t)
       this.$emit('seek', t)
       const idx = findCueIndex(this.cues, t)
       this.activeIdx = idx

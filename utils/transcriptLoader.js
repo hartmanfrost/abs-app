@@ -1,4 +1,5 @@
 import { parseTranscriptAsync, offsetCues, mergeCues, pickTranscriptSources } from './transcript.js'
+import { pickEpub } from './epub/bookSource.js'
 
 /**
  * Per-item transcript cache (memory only). Keeps the two most recently used books so switching
@@ -15,24 +16,31 @@ function touch(key, value) {
 }
 
 /**
- * Fetch the expanded library item and work out which sidecar transcripts exist for it.
- * Never throws: returns [] when the item cannot be fetched (offline, no permission, podcast, ...).
+ * Fetch the library item once and work out which sidecar files exist for it: VTT/SRT transcripts and an EPUB.
+ * Never throws: returns empty results when the item cannot be fetched (offline, no permission, podcast, ...).
  * @param {{ get: Function }} http the app's $nativeHttp
  * @param {string} libraryItemId
+ * @returns {Promise<{ sources: Array, epub: object|null }>}
  */
-export async function fetchTranscriptSources(http, libraryItemId) {
-  if (!libraryItemId) return []
+export async function fetchItemFiles(http, libraryItemId) {
+  if (!libraryItemId) return { sources: [], epub: null }
   try {
     const item = await http.get(`/api/items/${libraryItemId}`)
-    return pickTranscriptSources(item).map((s) => {
+    const sources = pickTranscriptSources(item).map((s) => {
       const file = (item.libraryFiles || []).find((f) => String(f.ino) === s.ino)
       const md = (file && file.metadata) || {}
       return { ...s, signature: `${s.ino}:${md.size || 0}:${Math.floor(md.mtimeMs || 0)}` }
     })
+    return { sources, epub: pickEpub(item) }
   } catch (error) {
     console.warn('[transcript] Failed to look up transcript files', error && error.message)
-    return []
+    return { sources: [], epub: null }
   }
+}
+
+/** Transcript sources only (kept for callers that do not care about the EPUB). */
+export async function fetchTranscriptSources(http, libraryItemId) {
+  return (await fetchItemFiles(http, libraryItemId)).sources
 }
 
 /**

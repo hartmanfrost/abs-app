@@ -107,7 +107,8 @@
       </div>
     </div>
 
-    <app-transcript-view v-if="showTranscript && showFullscreen && hasTranscript" :library-item-id="transcriptItemId" :sources="transcriptSources" :current-time="currentTime" :is-playing="isPlaying" :playback-rate="currentPlaybackRate" :chapters="chapters" :duration="totalDuration" :cover-color="coverRgb" @seek="seek" @toggle-play="playPauseClick" @close="closeTranscript" />
+    <app-book-reader v-if="showTranscript && showFullscreen && readerMode === 'book'" :key="'book-' + transcriptItemId" :library-item-id="transcriptItemId" :file="bookFile" :current-time="currentTime" :is-playing="isPlaying" :playback-rate="currentPlaybackRate" :chapters="chapters" :duration="totalDuration" :cover-color="coverRgb" :can-switch-mode="transcriptSources.length > 0" @seek="seek" @toggle-play="playPauseClick" @close="closeTranscript" @switch-mode="setReaderMode('transcript')" />
+    <app-transcript-view v-else-if="showTranscript && showFullscreen && readerMode === 'transcript'" :library-item-id="transcriptItemId" :sources="transcriptSources" :current-time="currentTime" :is-playing="isPlaying" :playback-rate="currentPlaybackRate" :chapters="chapters" :duration="totalDuration" :cover-color="coverRgb" :can-switch-mode="!!bookFile" @seek="seek" @toggle-play="playPauseClick" @close="closeTranscript" @switch-mode="setReaderMode('book')" />
 
     <modals-chapters-modal v-model="showChapterModal" :current-chapter="currentChapter" :chapters="chapters" :playback-rate="currentPlaybackRate" @select="selectChapter" />
     <modals-dialog v-model="showMoreMenuDialog" :items="menuItems" width="80vw" @action="clickMenuAction" />
@@ -122,7 +123,11 @@ import { KeepAwake } from '@capacitor-community/keep-awake'
 import { getAverageColorFromCoverUrl } from '@/utils/coverAverageColor'
 import WrappingMarquee from '@/assets/WrappingMarquee.js'
 import jumpLabelMixin from '@/mixins/jumpLabel'
-import { fetchTranscriptSources } from '@/utils/transcriptLoader'
+import { fetchItemFiles } from '@/utils/transcriptLoader'
+import { probeSyncedEpub } from '@/utils/epub/bookSource'
+import { closeBook } from '@/utils/epub/epubBook'
+
+const READER_MODE_KEY = 'absReaderMode'
 
 export default {
   props: {
@@ -176,6 +181,9 @@ export default {
       isRefreshingUI: false,
       // Sidecar .vtt/.srt transcript files found for the playing book (see utils/transcript.js)
       transcriptSources: [],
+      // Synced EPUB (word-level read-along) of the playing book, once confirmed to carry media overlays
+      bookFile: null,
+      preferredMode: '',
       showTranscript: false
     }
   },
@@ -405,7 +413,13 @@ export default {
       return this.playbackSession?.libraryItemId || ''
     },
     hasTranscript() {
-      return !this.isPodcast && !!this.transcriptItemId && this.transcriptSources.length > 0
+      return !this.isPodcast && !!this.transcriptItemId && (this.transcriptSources.length > 0 || !!this.bookFile)
+    },
+    // Book view when a synced EPUB exists (unless the user last chose the transcript), else the transcript
+    readerMode() {
+      if (!this.bookFile) return this.transcriptSources.length ? 'transcript' : ''
+      if (!this.transcriptSources.length) return 'book'
+      return this.preferredMode === 'transcript' ? 'transcript' : 'book'
     },
     mediaId() {
       if (this.isPodcast || !this.playbackSession) return null
@@ -429,12 +443,32 @@ export default {
     // Look up sidecar transcripts for the playing book (no-op for podcasts / when the server is unreachable)
     async loadTranscriptSources() {
       this.transcriptSources = []
+      this.bookFile = null
       this.showTranscript = false
       const itemId = this.playbackSession?.libraryItemId
       if (!itemId || this.isPodcast) return
-      const sources = await fetchTranscriptSources(this.$nativeHttp, itemId)
+      try {
+        this.preferredMode = window.localStorage.getItem(READER_MODE_KEY) || ''
+      } catch (e) {
+        this.preferredMode = ''
+      }
+      const { sources, epub } = await fetchItemFiles(this.$nativeHttp, itemId)
       // Ignore the answer if another book started meanwhile
-      if (this.playbackSession?.libraryItemId === itemId) this.transcriptSources = sources
+      if (this.playbackSession?.libraryItemId !== itemId) return
+      this.transcriptSources = sources
+      if (epub) {
+        // Only an EPUB with media overlays counts; checking reads a few hundred KB of the archive once per file version
+        const synced = await probeSyncedEpub(this.$nativeHttp, itemId, epub)
+        if (this.playbackSession?.libraryItemId === itemId) this.bookFile = synced
+      }
+    },
+    setReaderMode(mode) {
+      this.preferredMode = mode
+      try {
+        window.localStorage.setItem(READER_MODE_KEY, mode)
+      } catch (e) {
+        // not remembered
+      }
     },
     closeTranscript() {
       this.showTranscript = false
@@ -834,6 +868,8 @@ export default {
     },
     endPlayback() {
       this.transcriptSources = []
+      this.bookFile = null
+      closeBook()
       this.showTranscript = false
       this.$store.commit('setPlaybackSession', null)
       this.showFullscreen = false
