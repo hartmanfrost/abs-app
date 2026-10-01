@@ -71,7 +71,7 @@ const ACTIVE_CLASS = '-epub-media-overlay-active'
 const IDENTIFIER = 'urn:uuid:7c1d1f3e-5b0a-4d55-9a4e-0f3d2f6a9b11'
 
 // ---- binary helpers ----
-function png(w, h, rgb) {
+function png(w, h, rgb, flat = false) {
   const crcT = (() => {
     const t = new Uint32Array(256)
     for (let n = 0; n < 256; n++) {
@@ -99,8 +99,9 @@ function png(w, h, rgb) {
     raw[y * (w * 3 + 1)] = 0
     for (let x = 0; x < w; x++) {
       const o = y * (w * 3 + 1) + 1 + x * 3
-      raw[o] = Math.round(rgb[0] * (0.4 + 0.6 * (x / w)))
-      raw[o + 1] = Math.round(rgb[1] * (0.4 + 0.6 * (y / h)))
+      // flat: a (nearly) solid colour so illustrations are told apart at a glance in screenshots
+      raw[o] = flat ? Math.round(rgb[0] * (0.9 + 0.1 * (x / w))) : Math.round(rgb[0] * (0.4 + 0.6 * (x / w)))
+      raw[o + 1] = flat ? Math.round(rgb[1] * (0.9 + 0.1 * (y / h))) : Math.round(rgb[1] * (0.4 + 0.6 * (y / h)))
       raw[o + 2] = rgb[2]
     }
   }
@@ -150,6 +151,7 @@ const hms = (t) => {
 let wid = 0
 let clock = 1.0
 const meta = []
+const illustrations = []
 const files = []
 const manifest = []
 const spine = []
@@ -191,10 +193,16 @@ CHAPTERS.forEach((ch, ci) => {
   const paras = paragraphs(ch.words)
   paras.forEach((p, pi) => {
     // extra widget slot + popover between paragraphs 1 and 2
-    const inner = p.map((w, wi) => span(w, wi % 17 === 5)).join(' ')
+    const lastWid = () => 'w' + pad(wid)
+    const nextWid = () => 'w' + pad(wid + 1)
+    // ch1 paragraph 2: a tiny inline ornament between words (a text glyph, not an illustration)
+    const inner = p
+      .map((w, wi) => span(w, wi % 17 === 5) + (n === 1 && pi === 2 && wi === 10 ? ' <img class="orn" width="14" height="14" src="assets/images/orn.png" alt=""/>' : ''))
+      .join(' ')
     body.push(`<p class="${pi === 0 ? 'dropcap' : 'body'}">${inner}</p>`)
     clock += PARA_GAP
     if (pi === 0 && ch.widget) {
+      illustrations.push({ id: 'W', chapter: n, kind: 'widget', path: 'OPS/assets/images/thumb.png', afterWordId: lastWid(), firstWordIdAfter: nextWid() })
       body.push(
         `<object id="framethumb-${n}" class="wobj" type="application/x-ibooks+widget" title="Frame" data-widget-type="html" data-geometry="affineGeometry(768,317,1,0,0,1,0,0)" data-fullscreen-only="yes" data-expanded-only="no" data-autoplay="yes" data-content-layout="top-bottom" data-stage-geometry="affineGeometry(400,300,1,0,0,1,0,0)" data-fullscreen-stage-geometry="affineGeometry(800,600,1,0,0,1,0,0)" data-starting-file="index.html" data-notifies-on-ready="yes" data-bundle-path="assets/widgets/W1.dummy.wdgt"><figure><a href="javascript:window.location='assets/widgets/W1.dummy.wdgt/index.html'" class="widget-link"><img class="thumb" width="400" height="300" src="assets/images/thumb.png" id="image-${n}" data-widget-object-type="stage-thumb" alt=""/></a></figure></object>`
       )
@@ -202,7 +210,32 @@ CHAPTERS.forEach((ch, ci) => {
     if (pi === 1 && ch.popover) {
       body.push(`<object id="viewport-popup-${n}" type="application/x-ibooks+widget" data-widget-type="viewport" class="pop" title="Pop-Over" data-viewport-size="{400, 120}"><div id="textShape-${n}"><p id="textShape-${n}-p0" class="pop-text">Glossary note about the invented word lantern keeper.</p></div></object>`)
     }
-    if (pi === 2) body.push(`<p class="figure"><img class="illus" width="240" height="140" src="assets/images/illus.png" alt="illustration"/></p>`)
+    if (n === 1 && pi === 1) {
+      illustrations.push({ id: 'A', chapter: n, kind: 'img', path: 'OPS/assets/images/ill-a.png', afterWordId: lastWid(), firstWordIdAfter: nextWid() })
+      body.push(`<p class="figure"><img class="illus" width="240" height="140" src="assets/images/ill-a.png" alt="A"/></p>`)
+    }
+    if (n === 1 && pi === 3) {
+      illustrations.push({ id: 'B', chapter: n, kind: 'svg', path: 'OPS/assets/images/ill-b.png', afterWordId: lastWid(), firstWordIdAfter: nextWid() })
+      body.push(`<div class="svgwrap"><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" viewBox="0 0 300 200" width="300" height="200"><image width="300" height="200" xlink:href="assets/images/ill-b.png"/></svg></div>`)
+    }
+    if (n === 2 && pi === 4) {
+      const after = lastWid()
+      const imgHtml = `<img class="illus" width="260" height="160" src="assets/images/ill-c.png" alt="C"/>`
+      const first = nextWid()
+      const capIds = []
+      const cap = ['Lanterns', 'glow', 'beside', 'the', 'quiet', 'harbour.'].map((w) => {
+        const h = span(w)
+        capIds.push('w' + pad(wid))
+        return h
+      })
+      illustrations.push({ id: 'C', chapter: n, kind: 'figure', path: 'OPS/assets/images/ill-c.png', afterWordId: after, firstWordIdAfter: first, narratedCaption: capIds })
+      body.push(`<figure class="fig">${imgHtml}<figcaption>${cap.join(' ')}</figcaption></figure>`)
+      clock += PARA_GAP
+    }
+    if (n === 2 && pi === 8) {
+      illustrations.push({ id: 'D', chapter: n, kind: 'img', path: 'OPS/assets/images/ill-d.png', afterWordId: lastWid(), firstWordIdAfter: nextWid() })
+      body.push(`<p class="figure"><img class="illus" width="240" height="140" src="assets/images/ill-d.png" alt="D"/></p>`)
+    }
   })
   const xhtml = `<?xml version="1.0" encoding="UTF-8"?>\n<html xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="en" xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8"/><title>Untitled</title><link rel="stylesheet" type="text/css" href="assets/css/content${n}.css"/></head><body>${body.join('')}</body></html>`
   files.push({ name: `OPS/content${n}.xhtml`, data: xhtml })
@@ -215,6 +248,10 @@ CHAPTERS.forEach((ch, ci) => {
 p.body,p.dropcap{margin:0 0 14px 0;text-align:justify;font-size:18px}
 p.dropcap::first-letter{float:left;font-size:72px;line-height:60px;padding:4px 8px 0 0;color:#a05a00;font-weight:bold}
 img.illus{display:block;margin:12px auto}
+img.orn{display:inline;vertical-align:middle;margin:0 2px}
+.svgwrap{text-align:center;margin:12px 0}
+figure.fig{margin:12px auto;text-align:center}
+figure.fig figcaption{font-size:15px;font-style:italic}
 object.pop{display:block;border:1px solid #999;padding:6px;margin:10px 0}
 .pop-text{font-size:15px;margin:0}
 em{font-style:italic}
@@ -243,7 +280,11 @@ ${meta.map((m) => `<meta property="media:duration" refines="#smil${m.index}">${h
 ${manifest.join('\n')}
 <item id="font1" href="assets/fonts/SynthSans.ttf" media-type="font/ttf"/>
 <item id="img1" href="assets/images/thumb.png" media-type="image/png"/>
-<item id="img2" href="assets/images/illus.png" media-type="image/png"/>
+<item id="img-a" href="assets/images/ill-a.png" media-type="image/png"/>
+<item id="img-b" href="assets/images/ill-b.png" media-type="image/png"/>
+<item id="img-c" href="assets/images/ill-c.png" media-type="image/png"/>
+<item id="img-d" href="assets/images/ill-d.png" media-type="image/png"/>
+<item id="img-orn" href="assets/images/orn.png" media-type="image/png"/>
 </manifest>
 <spine>${spine.join('')}</spine>
 </package>`
@@ -298,7 +339,11 @@ const entries = [
   ...files,
   { name: 'OPS/assets/fonts/SynthSans.ttf', data: obfuscate(fontSrc, IDENTIFIER), method: 'store' },
   { name: 'OPS/assets/images/thumb.png', data: png(400, 300, [200, 120, 60]), method: 'store' },
-  { name: 'OPS/assets/images/illus.png', data: png(240, 140, [60, 120, 200]), method: 'store' },
+  { name: 'OPS/assets/images/ill-a.png', data: png(300, 200, [230, 60, 60], true), method: 'store' },
+  { name: 'OPS/assets/images/ill-b.png', data: png(300, 200, [50, 200, 70], true), method: 'store' },
+  { name: 'OPS/assets/images/ill-c.png', data: png(300, 200, [60, 90, 230], true), method: 'store' },
+  { name: 'OPS/assets/images/ill-d.png', data: png(300, 200, [240, 220, 40], true), method: 'store' },
+  { name: 'OPS/assets/images/orn.png', data: png(14, 14, [120, 40, 160], true), method: 'store' },
   { name: wdgt + 'index.html', data: widgetIndex },
   { name: wdgt + 'AppleClasses/AppleWidget.js', data: appleWidget },
   { name: wdgt + 'sound.wav', data: wav(1), method: 'store' },
@@ -316,6 +361,6 @@ if (!flag('--no-audio')) {
 }
 writeFileSync(
   path.join(outDir, 'fixture.json'),
-  JSON.stringify({ basename, identifier: IDENTIFIER, activeClass: ACTIVE_CLASS, wordSeconds: WORD_SEC, audioDurationSec: duration, narrationEndSec: totalDuration, audio, epub: basename + '.epub', big: BIG, font: { family: 'SynthSans', path: 'OPS/assets/fonts/SynthSans.ttf', obfuscated: 'idpf', source: 'static/fonts/Source_Sans_Pro/SourceSansPro-Regular.ttf' }, widget: { bundle: 'OPS/assets/widgets/W1.dummy.wdgt', chapter: 2, dataBinBytes: rng.length, rangeProbe: 'bytes=1000-1999' }, chapters: meta }, null, 1)
+  JSON.stringify({ basename, identifier: IDENTIFIER, activeClass: ACTIVE_CLASS, wordSeconds: WORD_SEC, audioDurationSec: duration, narrationEndSec: totalDuration, audio, epub: basename + '.epub', big: BIG, font: { family: 'SynthSans', path: 'OPS/assets/fonts/SynthSans.ttf', obfuscated: 'idpf', source: 'static/fonts/Source_Sans_Pro/SourceSansPro-Regular.ttf' }, widget: { bundle: 'OPS/assets/widgets/W1.dummy.wdgt', chapter: 2, dataBinBytes: rng.length, rangeProbe: 'bytes=1000-1999' }, illustrations, ornament: { chapter: 1, path: 'OPS/assets/images/orn.png' }, chapters: meta }, null, 1)
 )
 console.log(`wrote ${basename}.epub (${meta.map((m) => m.wordCount).join('/')} words, narration ${totalDuration.toFixed(1)}s) to ${outDir}`)

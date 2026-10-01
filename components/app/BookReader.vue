@@ -1,5 +1,5 @@
 <template>
-  <div ref="root" class="book-reader absolute top-0 left-0 w-full h-full z-40 pointer-events-auto flex flex-col" :style="{ '--tr-bg': coverColor }" role="dialog" :aria-label="$strings.LabelReaderBook" tabindex="-1">
+  <div ref="root" class="book-reader absolute top-0 left-0 w-full h-full z-40 pointer-events-auto flex flex-col" :class="{ 'bk-night': night }" :style="{ '--tr-bg': coverColor }" role="dialog" :aria-label="$strings.LabelReaderBook" tabindex="-1">
     <!-- Header: chapter title, position, controls (same row as the transcript view) -->
     <div class="tr-head flex items-center px-4 pt-3 pb-2">
       <div class="flex-1 min-w-0 pr-3">
@@ -24,8 +24,21 @@
     </div>
 
     <!-- Body: the chapter lives in an isolated iframe document with the book's own CSS; it is scaled as a whole for 10-foot viewing -->
-    <div ref="body" class="bk-body relative flex-1 overflow-hidden">
-      <iframe ref="frame" class="bk-frame" :class="{ 'bk-frame-hidden': status !== 'ready' }" :style="frameStyle" tabindex="-1" title="Book"></iframe>
+    <div ref="body" class="bk-body relative flex-1 overflow-hidden flex" :class="{ 'bk-swapped': swapped }">
+      <div ref="col" class="bk-col relative">
+        <iframe ref="frame" class="bk-frame" :class="{ 'bk-frame-hidden': status !== 'ready' }" :style="frameStyle" tabindex="-1" title="Book"></iframe>
+      </div>
+      <!-- Right third (wide screens): the illustration that belongs to the reading position, sticky until the next one -->
+      <div v-if="twoPane" ref="pane" class="bk-pane relative" :class="{ 'bk-pane-focus': zone === 'pane' }" role="img" :aria-label="(paneItem && paneItem.alt) || $strings.LabelReaderIllustration" @click.stop="openPane">
+        <div v-if="paneItem" ref="paneBox" class="bk-pane-box" :style="paneBoxStyle">
+          <img v-if="paneItem.src" :src="paneItem.src" class="bk-pane-img" alt="" @load="onPaneImgLoad" />
+        </div>
+        <div v-else class="bk-pane-empty">
+          <span class="material-symbols bk-pane-empty-icon">image</span>
+          <p class="bk-pane-empty-title">{{ headerChapter }}</p>
+          <p class="bk-pane-empty-note">{{ $strings.MessageReaderPaneEmpty }}</p>
+        </div>
+      </div>
       <div v-if="status === 'loading'" class="absolute inset-0 flex flex-col items-center justify-center text-fg-muted bk-overlay">
         <widgets-spinner-icon class="h-10 w-10 mb-3" />
         <p>{{ $strings.MessageReaderBookLoading }} <span v-if="progress > 0 && progress < 1">{{ Math.round(progress * 100) }}%</span></p>
@@ -45,7 +58,7 @@
         <img v-else-if="widgetOpen.thumb" :src="widgetOpen.thumb" class="bk-wthumb" alt="" />
         <div v-if="widgetOpen.src && isTv" class="bk-pointer" :style="{ left: pointer.x + 'px', top: pointer.y + 'px' }"></div>
       </div>
-      <p class="bk-whint truncate">{{ $strings.MessageReaderWidgetHint }}</p>
+      <p class="bk-whint truncate">{{ widgetOpen.still ? $strings.MessageReaderStillHint : $strings.MessageReaderWidgetHint }}</p>
     </div>
   </div>
 </template>
@@ -57,11 +70,15 @@ import { openBookFor } from '@/utils/epub/epubBook'
 import { buildChapterHtml, hydrateChapter } from '@/utils/epub/chapterRender'
 import { ensureVfs, mountBook, unmountBook, vfsUrl } from '@/utils/epub/vfs'
 import { formatClock } from '@/utils/transcript'
+import { positionsFromOrder, selectIllustration, lineKeypoints, scrollYAt, easeToward, ClockSmoother } from '@/utils/epub/readAlong'
+import { FONT_SCALES, DEFAULT_FONT_LEVEL, NIGHT_KEY, SMOOTH_KEY, SWAP_KEY, loadFontLevel, saveFontLevel, loadFlag, saveFlag } from '@/utils/readerPrefs'
 import playbackClock from '@/mixins/playbackClock'
 import { enterReader, leaveReader } from '@/utils/readerFlag'
 
-const FONT_SCALES = [0.8, 1, 1.25, 1.5, 1.8]
-const FONT_STORAGE_KEY = 'absBookFontLevel'
+const FONT_KEY = 'absBookFontScale'
+const FONT_LEGACY_KEY = 'absBookFontLevel' // index into the pre-vc121 table
+const READ_LINE = 0.3 // Smooth scroll keeps the active line at this fraction of the page height
+const SMOOTH_TAU = 0.12 // seconds, easing of the scroll towards the reading line
 const BLOCKS = 'p,h1,h2,h3,h4,h5,h6,li,dd,dt,blockquote,figcaption,td,th,pre,div'
 const WORD_ID = /^w\d+$/
 const MAX_MATCHES = 400
@@ -86,10 +103,16 @@ export default {
       status: 'loading', // loading | ready | error | unsynced
       progress: 0,
       chapterLoading: false,
-      zone: 'list', // list | header
+      zone: 'list', // list | header | pane
       headerIdx: 0,
       following: true,
-      fontLevel: 1,
+      fontLevel: DEFAULT_FONT_LEVEL,
+      night: false,
+      smooth: true,
+      swapped: false, // wide layout mirrored: illustrations on the left, text on the right (same proportions)
+      paneItem: null, // illustration shown in the right pane: { key, kind, w, h, aspect, alt, src, thumbPath, spec, chapter }
+      paneW: 0,
+      paneH: 0,
       viewChapter: 0,
       selIdx: -1,
       selKind: 'p',
@@ -113,6 +136,23 @@ export default {
     isTv() {
       return !!this.$store.state.isAndroidTv
     },
+    // Wide landscape screens (TV, tablets, phones on their side): text on the left two thirds, illustrations on the right third
+    twoPane() {
+      return this.rootW >= 700 && this.rootW >= this.rootH * 1.2
+    },
+    // Smooth scrolling moves the page by transform while following playback; on a touch phone the page is scrolled by hand instead
+    smoothAvail() {
+      return this.isTv || this.twoPane
+    },
+    paneBoxStyle() {
+      const it = this.paneItem
+      if (!it || !this.paneW || !this.paneH) return {}
+      const aw = this.paneW - 24
+      const ah = this.paneH - 24
+      const a = it.aspect > 0 ? it.aspect : 4 / 3
+      const w = Math.max(10, Math.min(aw, ah * a))
+      return { width: Math.round(w) + 'px', height: Math.round(w / a) + 'px' }
+    },
     frameStyle() {
       const s = this.scale || 1
       return { width: this.bodyW / s + 'px', height: this.bodyH / s + 'px', transform: `scale(${s})` }
@@ -124,7 +164,8 @@ export default {
       return { width: o.w + 'px', height: o.h + 'px', transform: `translate(-50%, -50%) scale(${k})` }
     },
     hint() {
-      if (this.following) return this.$strings.MessageReaderHintFollow
+      if (this.zone === 'pane') return this.swapped ? this.$strings.MessageReaderHintPaneSwapped : this.$strings.MessageReaderHintPane
+      if (this.following) return this.twoPane ? (this.swapped ? this.$strings.MessageReaderHintFollowWideSwapped : this.$strings.MessageReaderHintFollowWide) : this.$strings.MessageReaderHintFollow
       return this.selKind === 'widget' ? this.$strings.MessageReaderHintWidget : this.$strings.MessageReaderHintBrowse
     },
     headerButtons() {
@@ -132,9 +173,14 @@ export default {
         { id: 'play', icon: this.isPlaying ? 'pause' : 'play_arrow', label: this.$strings.LabelTranscriptPlayPause, action: () => this.$emit('toggle-play') },
         { id: 'follow', icon: 'my_location', label: this.$strings.LabelTranscriptFollow, disabled: this.following, action: () => this.resumeFollow() },
         { id: 'smaller', icon: 'text_decrease', label: this.$strings.LabelTranscriptFontSmaller, disabled: this.fontLevel === 0, action: () => this.changeFont(-1) },
-        { id: 'larger', icon: 'text_increase', label: this.$strings.LabelTranscriptFontLarger, disabled: this.fontLevel === FONT_SCALES.length - 1, action: () => this.changeFont(1) },
-        { id: 'search', icon: 'search', label: this.$strings.LabelReaderBookSearch, action: () => this.toggleSearch() }
+        { id: 'larger', icon: 'text_increase', label: this.$strings.LabelTranscriptFontLarger, disabled: this.fontLevel === FONT_SCALES.length - 1, action: () => this.changeFont(1) }
       ]
+      if (this.twoPane) buttons.push({ id: 'swap', icon: 'swap_horiz', label: this.$strings.LabelReaderSwapPanes, action: () => this.toggleSwap() })
+      if (this.smoothAvail) buttons.push({ id: 'scroll', icon: this.smooth ? 'swipe_vertical' : 'format_line_spacing', label: this.smooth ? this.$strings.LabelReaderScrollSmooth : this.$strings.LabelReaderScrollStep, action: () => this.toggleSmooth() })
+      buttons.push(
+        { id: 'night', icon: this.night ? 'light_mode' : 'dark_mode', label: this.night ? this.$strings.LabelReaderDayMode : this.$strings.LabelReaderNightMode, action: () => this.toggleNight() },
+        { id: 'search', icon: 'search', label: this.$strings.LabelReaderBookSearch, action: () => this.toggleSearch() }
+      )
       if (this.searchOpen && this.matchCount) {
         buttons.push({ id: 'prev-match', icon: 'keyboard_arrow_up', label: this.$strings.LabelTranscriptPrevMatch, action: () => this.gotoMatch(this.matchPos - 1) })
         buttons.push({ id: 'next-match', icon: 'keyboard_arrow_down', label: this.$strings.LabelTranscriptNextMatch, action: () => this.gotoMatch(this.matchPos + 1) })
@@ -168,6 +214,34 @@ export default {
     },
     headerButtons(list) {
       if (this.headerIdx >= list.length) this.headerIdx = list.length - 1
+    },
+    twoPane(on) {
+      if (!on && this.zone === 'pane') this.zone = 'list'
+      // The pane appears/disappears: re-measure the text column, then rebuild the chapter (illustrations are in or out of the flow)
+      this.$nextTick(() => {
+        this.measure()
+        if (this.doc && this.status === 'ready') this.reloadForLayout()
+      })
+    },
+    night() {
+      this.applyNight()
+    },
+    smooth() {
+      this.syncSmooth()
+    },
+    isPlaying() {
+      this.syncSmooth()
+    },
+    following() {
+      this.syncSmooth()
+    },
+    widgetOpen(o) {
+      if (o) this.stopPaneLive()
+      else this.schedulePaneLive()
+      this.syncSmooth()
+    },
+    zone(z) {
+      if (z === 'pane' && !this.paneItem) this.zone = 'list'
     }
   },
   created() {
@@ -199,12 +273,34 @@ export default {
     this.lastBackAt = 0
     this.dropcaps = []
     this.wasPlayingBeforeWidget = false
+    this.illus = [] // illustrations of the displayed chapter (document order)
+    this.illusPos = [] // their positions: number of words before each
+    this.wordOrd = new Map() // word element -> ordinal in the chapter
+    this.carry = null // last illustration of the chapters before the displayed one
+    this.carryPending = false
+    this.carryCache = new Map() // chapter index -> its last illustration (or null)
+    this.paneLiveTimer = null
+    this.paneLive = null
+    this.smoothRun = false
+    this.smRaf = 0
+    this.smBase = 0
+    this.smY = 0
+    this.smLast = 0
+    this.smKeys = []
+    this.smKeyPar = -2
+    this.yCache = new Map()
+    this.smClock = new ClockSmoother()
+    this.smFrame = (now) => this.smStep(now)
+    let storage = null
     try {
-      const stored = parseInt(window.localStorage.getItem(FONT_STORAGE_KEY), 10)
-      if (stored >= 0 && stored < FONT_SCALES.length) this.fontLevel = stored
+      storage = window.localStorage
     } catch (e) {
-      // localStorage unavailable: keep the default size
+      // localStorage unavailable: defaults apply
     }
+    this.fontLevel = loadFontLevel(storage, FONT_KEY, FONT_LEGACY_KEY)
+    this.night = loadFlag(storage, NIGHT_KEY, false)
+    this.smooth = loadFlag(storage, SMOOTH_KEY, true)
+    this.swapped = loadFlag(storage, SWAP_KEY, false)
   },
   mounted() {
     this.measure()
@@ -214,7 +310,11 @@ export default {
     this.$eventBus.$on('transcript-back', this.back)
     enterReader(this.$store)
     this.$refs.root && this.$refs.root.focus({ preventScroll: true })
-    this.open()
+    // The first measure decides whether the pane exists; the text column is measured again once it has been laid out
+    this.$nextTick(() => {
+      this.measure()
+      this.open()
+    })
   },
   beforeDestroy() {
     window.removeEventListener('keydown', this.onKeyDown, true)
@@ -226,6 +326,8 @@ export default {
     clearTimeout(this.liveTimer)
     clearTimeout(this.userScrollTimer)
     cancelAnimationFrame(this.scrollRaf)
+    cancelAnimationFrame(this.smRaf)
+    clearTimeout(this.paneLiveTimer)
     if (this.cancelHydrate) this.cancelHydrate()
     if (this.wasPlayingBeforeWidget && this.widgetOpen && !this.isPlaying) this.$emit('toggle-play')
     if (this.sid) unmountBook(this.sid)
@@ -234,16 +336,29 @@ export default {
   },
   methods: {
     measure() {
-      const body = this.$refs.body
-      if (!body) return
-      this.bodyW = body.clientWidth
-      this.bodyH = body.clientHeight
+      const col = this.$refs.col
+      if (!col) return
+      this.bodyW = col.clientWidth
+      this.bodyH = col.clientHeight
       this.rootW = this.$refs.root.clientWidth
       this.rootH = this.$refs.root.clientHeight
+      const pane = this.$refs.pane
+      this.paneW = pane ? pane.clientWidth : 0
+      this.paneH = pane ? pane.clientHeight : 0
     },
     onResize() {
       this.measure()
-      this.relayout()
+      // The pane may have just appeared: measure once more after it is laid out
+      this.$nextTick(() => {
+        this.measure()
+        this.relayout()
+      })
+    },
+    // Wide <-> narrow: the same chapter, rebuilt with/without its illustrations in the flow, at the same reading position
+    async reloadForLayout() {
+      const keep = this.following ? -1 : this.selIdx
+      if (!(await this.showChapter(this.viewChapter))) return
+      if (keep >= 0) this.select(keep)
     },
 
     // ---- opening ----
@@ -276,7 +391,8 @@ export default {
       const book = this.book
       this.chapterLoading = !initial
       try {
-        const built = await buildChapterHtml(book, idx)
+        const wide = this.twoPane
+        const built = await buildChapterHtml(book, idx, { extractIllustrations: wide })
         if (token !== this.loadToken) return false
         const smil = await book.timeline.smilFor(idx)
         if (token !== this.loadToken) return false
@@ -292,10 +408,15 @@ export default {
         this.smil = smil
         this.widgets = built.widgets
         this.dropcaps = built.dropcaps
+        this.illus = built.illustrations
+        this.yCache.clear()
+        this.smKeys = []
+        this.smKeyPar = -2
         this.viewChapter = idx
         this.lastPar = -1
         this.wordEl = this.paraEl = this.selEl = this.findEl = null
         this.cancelHydrate = hydrateChapter(this.doc, book, built.dropcaps)
+        this.applyNight()
         this.attach()
         try {
           await Promise.race([this.doc.fonts.ready, new Promise((r) => setTimeout(r, 2500))])
@@ -311,6 +432,9 @@ export default {
         this.selTime = -1
         this.win.scrollTo(0, 0)
         this.scheduleLive()
+        this.resolveCarry(idx, token)
+        this.updatePane()
+        this.syncSmooth()
         return true
       } catch (error) {
         console.error('[book] chapter failed', error)
@@ -335,6 +459,12 @@ export default {
         if (!this.autoScrolling && !this.isTv && this.following && this.status === 'ready') this.following = false
         this.scheduleLive()
       }
+      // Images that arrive late move the text: positions measured for Smooth scrolling are stale then
+      this.onDocLoad = () => {
+        this.yCache.clear()
+        this.smKeyPar = -2
+      }
+      doc.addEventListener('load', this.onDocLoad, true)
       doc.addEventListener('click', this.onDocClick)
       this.win.addEventListener('scroll', this.onDocScroll, { passive: true })
     },
@@ -342,6 +472,9 @@ export default {
       if (this.cancelHydrate) this.cancelHydrate()
       this.cancelHydrate = null
       this.liveWrap = null
+      // The document is going away: nothing to commit, just stop the animation
+      this.smoothRun = false
+      cancelAnimationFrame(this.smRaf)
       // The old document goes away with the next srcdoc; nothing else holds listeners on it
       this.doc = null
       this.win = null
@@ -350,8 +483,15 @@ export default {
       const doc = this.doc
       const items = []
       const index = new Map()
+      const order = [] // 0 = word, 1 = illustration marker, in document order
+      const ord = new Map()
+      let words = 0
       let last = null
-      doc.querySelectorAll('[id^="w"], .abs-widget').forEach((n) => {
+      doc.querySelectorAll('[id^="w"], .abs-widget, .abs-ill').forEach((n) => {
+        if (n.classList.contains('abs-ill')) {
+          order.push(1)
+          return
+        }
         if (n.classList.contains('abs-widget')) {
           index.set(n, items.length)
           items.push({ el: n, kind: 'widget', widget: parseInt(n.getAttribute('data-abs-w'), 10), first: null })
@@ -359,6 +499,8 @@ export default {
           return
         }
         if (!WORD_ID.test(n.id)) return
+        ord.set(n, words++)
+        order.push(0)
         const block = n.closest(BLOCKS) || n.parentElement
         if (block === last) return
         last = block
@@ -368,6 +510,8 @@ export default {
       })
       this.items = items
       this.itemIndex = index
+      this.wordOrd = ord
+      this.illusPos = positionsFromOrder(order)
     },
     relayout() {
       if (!this.doc || this.status !== 'ready') return
@@ -390,11 +534,15 @@ export default {
       }
       const h = this.bodyH + 60
       const target = this.isTv ? Math.max(20, h * 0.045) : Math.max(17, Math.min(24, h * 0.032))
-      this.scale = Math.min(3.5, Math.max(0.5, (target / base) * FONT_SCALES[this.fontLevel]))
+      this.scale = Math.min(6, Math.max(0.15, (target / base) * FONT_SCALES[this.fontLevel]))
+      // Line positions measured for Smooth scrolling are in the old size
+      this.yCache.clear()
+      this.smKeyPar = -2
     },
 
     // ---- playback following ----
     tick() {
+      this.syncSmooth()
       if (this.status !== 'ready' || !this.smil || !this.doc || this.widgetOpen) return
       if (!this.following) return
       const t = this.estimateTime()
@@ -426,9 +574,12 @@ export default {
       const old = this.wordEl
       let el = null
       if (par >= 0) el = doc.getElementById(this.smil.ids[par])
+      // (also when the word did not change: following may just have been resumed after browsing)
+      this.updatePane()
       if (old === el) return
       if (old) old.classList.remove(cls)
       this.wordEl = el
+      this.updatePane()
       if (!el) return
       el.classList.add(cls)
       const block = el.closest(BLOCKS)
@@ -437,15 +588,18 @@ export default {
         this.paraEl = block
         if (block) block.classList.add('abs-para-on')
       }
-      this.keepInView(el)
+      // Smooth scrolling (running or about to start) moves the page continuously; Step jumps when the word leaves the band
+      if (!this.smoothWanted()) this.keepInView(el)
     },
     keepInView(el) {
+      this.stopSmooth()
       const vh = this.win.innerHeight
       const r = el.getBoundingClientRect()
       if (r.top < vh * 0.05 || r.top > vh * 0.4 || r.bottom > vh * 0.5) this.scrollToY(this.win.scrollY + r.top - vh * 0.2, true)
     },
     scrollToCurrent(animate) {
       if (!this.win) return
+      this.stopSmooth()
       if (this.following && this.wordEl) {
         const r = this.wordEl.getBoundingClientRect()
         this.scrollToY(this.win.scrollY + r.top - this.win.innerHeight * 0.2, animate)
@@ -454,6 +608,7 @@ export default {
       }
     },
     scrollToItemEl(el, animate) {
+      this.stopSmooth()
       const vh = this.win.innerHeight
       const r = el.getBoundingClientRect()
       const y = r.height > vh * 0.7 ? this.win.scrollY + r.top - vh * 0.1 : this.win.scrollY + r.top - Math.max(vh * 0.12, (vh * 0.55 - r.height) / 2)
@@ -462,6 +617,7 @@ export default {
     scrollToY(y, animate) {
       const win = this.win
       if (!win) return
+      this.stopSmooth()
       cancelAnimationFrame(this.scrollRaf)
       const from = win.scrollY
       const to = Math.max(0, Math.round(y))
@@ -484,6 +640,253 @@ export default {
       this.scrollRaf = requestAnimationFrame(step)
     },
 
+    // ---- Smooth scrolling ----
+    // While following playback (and playing) the page is moved by a transform on <body>, once per animation frame, so that
+    // the active line stays at a fixed reading line: the target comes from the line positions interpolated over the SMIL
+    // clip times, the clock from the player's interpolation. No layout work happens per frame (positions are measured when
+    // the active word changes, then cached). Anything else (pause, browsing, Step, a widget) commits the offset to the real
+    // scroll position, so every other scroll code path works on native scrolling as before.
+    smoothWanted() {
+      return !!(this.smooth && this.smoothAvail && this.following && this.isPlaying && this.status === 'ready' && !this.widgetOpen && this.doc && this.win && this.smil && !this.relocating)
+    },
+    syncSmooth() {
+      const want = this.smoothWanted()
+      if (want && !this.smoothRun) this.startSmooth()
+      else if (!want && this.smoothRun) this.stopSmooth()
+    },
+    startSmooth() {
+      const doc = this.doc
+      if (!doc || !doc.body || !this.win) return
+      cancelAnimationFrame(this.scrollRaf)
+      this.smoothRun = true
+      this.smBase = this.win.scrollY
+      this.smY = 0
+      this.smKeyPar = -2
+      this.smClock.reset(NaN)
+      doc.body.style.willChange = 'transform'
+      this.smLast = performance.now()
+      cancelAnimationFrame(this.smRaf)
+      this.smRaf = requestAnimationFrame(this.smFrame)
+    },
+    stopSmooth() {
+      if (!this.smoothRun) return
+      this.smoothRun = false
+      cancelAnimationFrame(this.smRaf)
+      const win = this.win
+      const doc = this.doc
+      if (!win || !doc || !doc.body) return
+      const off = this.smY
+      this.smY = 0
+      doc.body.style.transform = ''
+      doc.body.style.willChange = ''
+      if (off) {
+        // Same task as removing the transform: the page does not move
+        this.autoScrolling = true
+        win.scrollTo(0, win.scrollY + off)
+        setTimeout(() => (this.autoScrolling = false), 60)
+      }
+    },
+    smStep(now) {
+      if (!this.smoothRun) return
+      const win = this.win
+      const doc = this.doc
+      if (!win || !doc || !doc.body || !this.smil) return
+      const dt = Math.min(0.1, Math.max(0, (now - this.smLast) / 1000))
+      this.smLast = now
+      const t = this.smClock.step(this.estimateTime(), dt, this.playbackRate || 1)
+      if (this.lastPar !== this.smKeyPar) this.buildSmoothKeys(this.lastPar)
+      if (this.smKeys.length) {
+        const vh = win.innerHeight
+        const maxScroll = Math.max(0, doc.documentElement.scrollHeight - vh)
+        const want = Math.min(maxScroll, Math.max(0, scrollYAt(this.smKeys, t) - vh * READ_LINE))
+        const next = easeToward(this.smY, want - this.smBase, dt, SMOOTH_TAU, vh * 2.5)
+        if (next !== this.smY) {
+          this.smY = next
+          doc.body.style.transform = `translate3d(0,${-next}px,0)`
+        }
+      }
+      this.smRaf = requestAnimationFrame(this.smFrame)
+    },
+    // Reading-line keypoints around the active word. Positions are cached per word (document coordinates), so this only reads
+    // layout for words not seen yet.
+    buildSmoothKeys(par) {
+      this.smKeyPar = par
+      const smil = this.smil
+      const win = this.win
+      const doc = this.doc
+      // Between two words (par -1) the previous keypoints stay: the page keeps gliding instead of stalling
+      if (par < 0 || !smil) return
+      const words = []
+      let h = 0
+      const order = smil.order
+      let rank = par
+      if (order) {
+        // SMIL file order is not time order in this book: walk the time-sorted view
+        if (!smil.rankOf) {
+          smil.rankOf = new Uint32Array(smil.n)
+          for (let k = 0; k < smil.n; k++) smil.rankOf[order[k]] = k
+        }
+        rank = smil.rankOf[par]
+      }
+      const hi = Math.min(smil.n - 1, rank + 40)
+      for (let k = Math.max(0, rank - 24); k <= hi; k++) {
+        const p = order ? order[k] : k
+        let c = this.yCache.get(p)
+        if (!c) {
+          const el = doc.getElementById(smil.ids[p])
+          if (!el) continue
+          const r = el.getBoundingClientRect()
+          // the rect includes the current transform: add it back to get a position that does not depend on the scroll
+          c = { y: r.top + win.scrollY + this.smY, h: r.height }
+          this.yCache.set(p, c)
+        }
+        h = c.h
+        words.push({ t0: smil.starts[p], t1: smil.ends[p], y: c.y })
+      }
+      this.smKeys = lineKeypoints(words, Math.max(4, h * 0.6))
+    },
+
+    // ---- illustration pane ----
+    // Position of the reading point in the chapter: ordinal of the active word (following) or of the first word of the browsed paragraph
+    currentPos() {
+      let el = null
+      if (this.following) el = this.wordEl
+      else {
+        const it = this.items[this.selIdx]
+        if (it && it.first && this.doc) el = this.doc.getElementById(it.first)
+      }
+      const o = el ? this.wordOrd.get(el) : undefined
+      return o === undefined ? -1 : o
+    },
+    updatePane() {
+      if (!this.twoPane || !this.doc) return
+      const sel = selectIllustration(this.illusPos, this.currentPos(), !!this.carry)
+      let desc = null
+      if (sel.source === 'chapter') desc = this.illus[sel.index]
+      else if (sel.source === 'carry') desc = this.carry
+      else if (this.carryPending && this.paneItem) return // keep what is shown until the previous chapters have been looked at
+      this.setPane(desc)
+    },
+    setPane(desc) {
+      const cur = this.paneItem
+      if (!desc) {
+        if (!cur) return
+        this.stopPaneLive()
+        this.paneItem = null
+        return
+      }
+      const key = desc.chapter + ':' + desc.index
+      if (cur && cur.key === key) return
+      this.stopPaneLive()
+      const spec = desc.widget
+      const aspect = desc.w > 0 && desc.h > 0 ? desc.w / desc.h : spec && spec.stageW > 0 && spec.stageH > 0 ? spec.stageW / spec.stageH : 0
+      this.paneItem = { key, kind: desc.kind, w: desc.w, h: desc.h, aspect, alt: desc.alt, src: '', spec, path: desc.path, chapter: desc.chapter }
+      if (desc.path && this.book) {
+        this.book
+          .blobUrl(desc.path)
+          .then((u) => {
+            if (this.paneItem && this.paneItem.key === key) this.paneItem.src = u
+          })
+          .catch(() => {})
+      }
+      this.schedulePaneLive()
+    },
+    onPaneImgLoad(e) {
+      const im = e.target
+      const it = this.paneItem
+      if (!it || !im.naturalWidth) return
+      it.aspect = im.naturalWidth / im.naturalHeight
+      it.w = im.naturalWidth
+      it.h = im.naturalHeight
+      this.$nextTick(() => this.schedulePaneLive())
+    },
+    // The illustrations of the previous chapters (the last one is what the pane keeps showing before this chapter's own first one)
+    async resolveCarry(idx, token) {
+      this.carry = null
+      this.carryPending = false
+      if (idx <= 0) return
+      this.carryPending = true
+      try {
+        for (let k = idx - 1; k >= 0 && k >= idx - 8; k--) {
+          let d = this.carryCache.get(k)
+          if (d === undefined) {
+            const r = await buildChapterHtml(this.book, k, { illustrationsOnly: true })
+            d = r.illustrations.length ? r.illustrations[r.illustrations.length - 1] : null
+            this.carryCache.set(k, d)
+          }
+          if (token !== this.loadToken) return
+          if (d) {
+            this.carry = d
+            break
+          }
+        }
+      } catch (e) {
+        // no carry-over: the pane starts empty
+      } finally {
+        if (token === this.loadToken) {
+          this.carryPending = false
+          this.updatePane()
+        }
+      }
+    },
+    // The one live (muted, autoplaying) widget: only in the pane, started a moment after it appears so that seeking around
+    // does not spin up video decoders
+    schedulePaneLive() {
+      clearTimeout(this.paneLiveTimer)
+      const it = this.paneItem
+      if (!it || it.kind !== 'widget' || !this.vfsOk || this.widgetOpen || this.paneLive) return
+      this.paneLiveTimer = setTimeout(() => this.startPaneLive(), 400)
+    },
+    startPaneLive() {
+      const it = this.paneItem
+      const box = this.$refs.paneBox
+      if (!it || it.kind !== 'widget' || !it.spec || this.paneLive || this.widgetOpen || !this.vfsOk || !box) return
+      const img = box.querySelector('img')
+      // The box is sized from the thumbnail, so wait for it
+      if (it.path && (!img || !(img.complete && img.naturalWidth))) return
+      const w = it.spec.stageW || 1024
+      const h = it.spec.stageH || 768
+      const ww = box.clientWidth
+      const wh = box.clientHeight
+      if (!ww || !wh) return
+      const f = document.createElement('iframe')
+      f.className = 'bk-pane-live'
+      f.setAttribute('tabindex', '-1')
+      f.setAttribute('allow', 'autoplay')
+      f.setAttribute('title', it.spec.title || 'widget')
+      // The thumbnail is a crop of the stage: scale the stage to cover the box and centre it
+      const k = Math.max(ww / w, wh / h)
+      f.style.cssText = 'position:absolute;border:0;transform-origin:0 0;background:#fff;pointer-events:none;opacity:0'
+      f.style.width = w + 'px'
+      f.style.height = h + 'px'
+      f.style.transform = `scale(${k})`
+      f.style.left = (ww - w * k) / 2 + 'px'
+      f.style.top = (wh - h * k) / 2 + 'px'
+      f.addEventListener('load', () => (f.style.opacity = '1'))
+      f.src = vfsUrl(this.sid, it.spec.bundle + '/' + it.spec.start, 'muted')
+      box.appendChild(f)
+      this.paneLive = f
+    },
+    stopPaneLive() {
+      clearTimeout(this.paneLiveTimer)
+      const f = this.paneLive
+      if (f) {
+        f.src = 'about:blank'
+        f.remove()
+        this.paneLive = null
+      }
+    },
+    // OK on the pane: the widget (with sound, the audiobook pauses) or the picture, full screen
+    openPane() {
+      const it = this.paneItem
+      if (!it || this.widgetOpen) return
+      if (it.kind === 'widget' && it.spec) return this.openWidgetSpec(it.spec, it.src)
+      const w = it.w > 0 ? it.w : 1000
+      const h = it.h > 0 ? it.h : Math.round(w / (it.aspect || 4 / 3))
+      this.widgetOpen = { index: -1, w, h, src: '', thumb: it.src, still: true }
+      this.$nextTick(() => this.$refs.root && this.$refs.root.focus({ preventScroll: true }))
+    },
+
     // ---- browsing ----
     select(i) {
       const items = this.items
@@ -496,6 +899,7 @@ export default {
       this.selEl = it.el
       it.el.classList.add('abs-sel')
       this.selTime = this.itemTime(it)
+      this.updatePane()
       this.scrollToItemEl(it.el, true)
       this.scheduleLive()
     },
@@ -648,11 +1052,16 @@ export default {
         f.remove()
       }
     },
+    // A widget of the displayed chapter that stays in the text flow (narrow layout)
     openWidget(index) {
       const spec = this.widgets[index]
       if (!spec || this.widgetOpen) return
       const wrap = this.doc.querySelector(`.abs-widget[data-abs-w="${index}"]`)
       const thumb = wrap && wrap.querySelector('img.abs-w-thumb')
+      this.openWidgetSpec(spec, thumb ? thumb.getAttribute('src') : '', index)
+    },
+    openWidgetSpec(spec, thumbSrc, index = -1) {
+      if (this.widgetOpen) return
       if (this.liveWrap) {
         this.stopLive(this.liveWrap)
         this.liveWrap = null
@@ -663,7 +1072,7 @@ export default {
       const w = spec.stageW || 1024
       const h = spec.stageH || 768
       this.pointer = { x: w / 2, y: h / 2 }
-      this.widgetOpen = { index, w, h, src: this.vfsOk ? vfsUrl(this.sid, spec.bundle + '/' + spec.start, 'live') : '', thumb: thumb ? thumb.getAttribute('src') : '' }
+      this.widgetOpen = { index, w, h, src: this.vfsOk ? vfsUrl(this.sid, spec.bundle + '/' + spec.start, 'live') : '', thumb: thumbSrc || '' }
       this.$nextTick(() => this.$refs.root && this.$refs.root.focus({ preventScroll: true }))
     },
     closeWidget() {
@@ -736,11 +1145,34 @@ export default {
       const next = Math.min(FONT_SCALES.length - 1, Math.max(0, this.fontLevel + delta))
       if (next === this.fontLevel) return
       this.fontLevel = next
+      saveFontLevel(this.storage(), FONT_KEY, next)
+    },
+    storage() {
       try {
-        window.localStorage.setItem(FONT_STORAGE_KEY, String(next))
+        return window.localStorage
       } catch (e) {
-        // ignore: preference simply is not remembered
+        return null
       }
+    },
+    toggleNight() {
+      this.night = !this.night
+      saveFlag(this.storage(), NIGHT_KEY, this.night)
+    },
+    applyNight() {
+      if (this.doc && this.doc.documentElement) this.doc.documentElement.classList.toggle('abs-night', this.night)
+    },
+    toggleSwap() {
+      this.swapped = !this.swapped
+      saveFlag(this.storage(), SWAP_KEY, this.swapped)
+      this.$nextTick(() => this.measure())
+    },
+    // Key that moves from the text to the pane (the pane is on the right, or on the left when swapped) and the one that comes back
+    paneKey() {
+      return this.swapped ? 'ArrowLeft' : 'ArrowRight'
+    },
+    toggleSmooth() {
+      this.smooth = !this.smooth
+      saveFlag(this.storage(), SMOOTH_KEY, this.smooth)
     },
     activateButton(i) {
       const b = this.headerButtons[i]
@@ -868,7 +1300,7 @@ export default {
       this.lastBackAt = now
       if (this.widgetOpen) return this.closeWidget()
       if (this.searchOpen) return this.closeSearch()
-      if (this.zone === 'header') {
+      if (this.zone === 'header' || this.zone === 'pane') {
         this.zone = 'list'
         return
       }
@@ -882,10 +1314,13 @@ export default {
     /*
      * Key map (same as the transcript view):
      *   text    Up / Down      previous / next paragraph (or widget); Up on the first one moves to the header
-     *           Left / Right   move focus to the header button row
+     *           Left / Right   wide layout: towards the illustration pane (Right; Left when the panes are swapped) focuses the pane,
+     *                          the other one the header button row; narrow layout: both go to the header row
      *           OK             following: play / pause; browsing: play from the paragraph / open the widget
+     *   pane    OK             open the illustration / widget full screen (a widget pauses the audiobook)
+     *           Down / Back / the key pointing at the text  return to the text; Up / the key pointing away  move to the header
      *   header  Left / Right   previous / next button, OK activates, Down returns to the text
-     *   widget  arrows move a pointer, OK taps, Back closes and resumes the audiobook
+     *   widget  arrows move a pointer, OK taps, Back closes and resumes the audiobook (a plain picture: OK or Back closes)
      */
     onKeyDown(e) {
       const k = e.key
@@ -896,7 +1331,9 @@ export default {
           this.back()
         } else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(k)) {
           this.consume(e)
-          if (k === 'Enter') this.tapWidget()
+          if (this.widgetOpen.still) {
+            if (k === 'Enter') this.closeWidget()
+          } else if (k === 'Enter') this.tapWidget()
           else this.movePointer(k === 'ArrowLeft' ? -1 : k === 'ArrowRight' ? 1 : 0, k === 'ArrowUp' ? -1 : k === 'ArrowDown' ? 1 : 0)
         }
         return
@@ -932,6 +1369,13 @@ export default {
       if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter'].includes(k)) return
       this.consume(e)
 
+      if (this.zone === 'pane') {
+        if (k === 'Enter') this.openPane()
+        else if (k === 'ArrowUp' || k === this.paneKey()) this.zone = 'header'
+        else this.zone = 'list'
+        return
+      }
+
       if (this.zone === 'header') {
         if (k === 'ArrowLeft') this.headerIdx = Math.max(0, this.headerIdx - 1)
         else if (k === 'ArrowRight') this.headerIdx = Math.min(this.headerButtons.length - 1, this.headerIdx + 1)
@@ -950,7 +1394,7 @@ export default {
       else if (k === 'ArrowUp') {
         this.browse(-1)
       } else if (k === 'ArrowLeft' || k === 'ArrowRight') {
-        this.zone = 'header'
+        this.zone = k === this.paneKey() && this.twoPane && this.paneItem ? 'pane' : 'header'
       } else if (k === 'Enter') {
         if (this.following) this.$emit('toggle-play')
         else if (this.selKind === 'widget') this.openWidget(this.items[this.selIdx].widget)
@@ -1025,6 +1469,16 @@ export default {
   border-color: var(--tv-focus-color, #1ad691);
   background: rgba(255, 255, 255, 0.12);
 }
+@media (max-width: 480px) {
+  /* the longer button row (night mode, scroll mode, ...) must still leave room for the clock: smaller buttons (declared
+     after the base rule so that they win) */
+  .tr-btn {
+    width: 2.1rem;
+    height: 2.1rem;
+    margin-left: 0;
+    font-size: 1.35rem;
+  }
+}
 .tr-search {
   width: 100%;
   padding: 0.4rem 0.75rem;
@@ -1040,6 +1494,85 @@ export default {
 }
 .bk-body {
   background: #fcfbf7;
+}
+.bk-col {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.bk-pane {
+  flex: 0 0 33.3333%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #efeadb;
+  border-left: 1px solid rgba(0, 0, 0, 0.14);
+  overflow: hidden;
+}
+.bk-swapped {
+  flex-direction: row-reverse;
+}
+.bk-swapped .bk-pane {
+  border-left: 0;
+  border-right: 1px solid rgba(0, 0, 0, 0.14);
+}
+.bk-night.book-reader .bk-swapped .bk-pane,
+.bk-night .bk-swapped .bk-pane {
+  border-right-color: #333;
+}
+.bk-pane-focus {
+  outline: 3px solid var(--tv-focus-color, #1ad691);
+  outline-offset: -3px;
+}
+.bk-pane-box {
+  position: relative;
+  overflow: hidden;
+  border-radius: 0.35rem;
+  background: rgba(0, 0, 0, 0.06);
+  box-shadow: 0 0.15rem 0.8rem rgba(0, 0, 0, 0.25);
+}
+.bk-pane-img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.bk-pane-empty {
+  padding: 1.5rem;
+  text-align: center;
+  color: rgba(0, 0, 0, 0.5);
+}
+.bk-pane-empty-icon {
+  font-size: 3rem;
+  opacity: 0.6;
+}
+.bk-pane-empty-title {
+  margin-top: 0.4rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+.bk-pane-empty-note {
+  margin-top: 0.2rem;
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+.bk-night.book-reader,
+.bk-night .bk-body,
+.bk-night .bk-frame {
+  background: #000;
+}
+.bk-night .bk-pane {
+  background: #000;
+  border-left-color: #333;
+}
+.bk-night .bk-pane-box {
+  background: #111;
+  box-shadow: 0 0 0 1px #333;
+}
+.bk-night .bk-pane-empty {
+  color: #b0b0b0;
 }
 .bk-frame {
   position: absolute;

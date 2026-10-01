@@ -1,5 +1,5 @@
 <template>
-  <div ref="root" class="transcript-view absolute top-0 left-0 w-full h-full z-40 pointer-events-auto flex flex-col" :style="{ '--tr-bg': coverColor }" role="dialog" :aria-label="$strings.LabelTranscript" tabindex="-1" @wheel.prevent="onWheel" @touchstart.passive="onTouchStart" @touchmove.prevent="onTouchMove">
+  <div ref="root" class="transcript-view absolute top-0 left-0 w-full h-full z-40 pointer-events-auto flex flex-col" :class="{ 'tr-night': night }" :style="{ '--tr-bg': coverColor }" role="dialog" :aria-label="$strings.LabelTranscript" tabindex="-1" @wheel.prevent="onWheel" @touchstart.passive="onTouchStart" @touchmove.prevent="onTouchMove">
     <!-- Header: chapter title, position, controls -->
     <div class="tr-head flex items-center px-4 pt-3 pb-2">
       <div class="flex-1 min-w-0 pr-3">
@@ -46,9 +46,11 @@ import { findCueIndex, findWordIndex, searchCues, formatClock, buildBlocks, seek
 import { loadTranscript } from '@/utils/transcriptLoader'
 import playbackClock from '@/mixins/playbackClock'
 import { enterReader, leaveReader } from '@/utils/readerFlag'
+import { FONT_SCALES, DEFAULT_FONT_LEVEL, NIGHT_KEY, loadFontLevel, saveFontLevel, loadFlag, saveFlag } from '@/utils/readerPrefs'
 
-const FONT_SCALES = [0.8, 1, 1.25, 1.5, 1.8]
-const FONT_STORAGE_KEY = 'absTranscriptFontLevel'
+// Font scale is stored as the scale itself; the old index-based key is migrated once by loadFontLevel
+const FONT_STORAGE_KEY = 'absTranscriptFontScale'
+const FONT_LEGACY_KEY = 'absTranscriptFontLevel'
 // Window sizes in blocks: a book paragraph holds several sentences, a legacy block is a single cue
 const WINDOW = { book: { before: 12, after: 24, margin: 6 }, legacy: { before: 30, after: 50, margin: 12 } }
 
@@ -85,7 +87,8 @@ export default {
       selectedBlock: 0,
       winStart: 0,
       winEnd: 0,
-      fontLevel: 1,
+      fontLevel: DEFAULT_FONT_LEVEL,
+      night: false,
       viewportHeight: 0,
       searchOpen: false,
       searchFocused: false,
@@ -101,7 +104,8 @@ export default {
     fontPx() {
       const h = this.viewportHeight || 600
       const base = this.isTv ? Math.max(18, Math.round(h * 0.04)) : Math.max(16, Math.min(22, Math.round(h * 0.028)))
-      return Math.round(base * FONT_SCALES[this.fontLevel])
+      // Lower bound of 8px so the smallest scale steps stay distinct instead of collapsing onto one size
+      return Math.max(8, Math.round(base * FONT_SCALES[this.fontLevel]))
     },
     win() {
       return this.book ? WINDOW.book : WINDOW.legacy
@@ -128,60 +132,7 @@ export default {
         { id: 'follow', icon: 'my_location', label: this.$strings.LabelTranscriptFollow, disabled: this.following, action: () => this.resumeFollow() },
         { id: 'smaller', icon: 'text_decrease', label: this.$strings.LabelTranscriptFontSmaller, disabled: this.fontLevel === 0, action: () => this.changeFont(-1) },
         { id: 'larger', icon: 'text_increase', label: this.$strings.LabelTranscriptFontLarger, disabled: this.fontLevel === FONT_SCALES.length - 1, action: () => this.changeFont(1) },
-        { id: 'search', icon: 'search', label: this.$strings.LabelTranscriptSearch, action: () => this.toggleSearch() }
-      ]
-      // Result navigation is a pair of header buttons so it stays reachable with the D-pad
-      if (this.searchOpen && this.matches.length) {
-        buttons.push({ id: 'prev-match', icon: 'keyboard_arrow_up', label: this.$strings.LabelTranscriptPrevMatch, action: () => this.gotoMatch(this.matchPos - 1) })
-        buttons.push({ id: 'next-match', icon: 'keyboard_arrow_down', label: this.$strings.LabelTranscriptNextMatch, action: () => this.gotoMatch(this.matchPos + 1) })
-      }
-      if (this.canSwitchMode) buttons.push({ id: 'mode', icon: 'menu_book', label: this.$strings.LabelReaderBook, action: () => this.$emit('switch-mode') })
-      buttons.push({ id: 'close', icon: 'close', label: this.$strings.ButtonClose, action: () => this.$emit('close') })
-      return buttons
-    },
-    // Book time of the row shown in the header: the playback position while following, else the browsed block
-    headerTime() {
-      if (this.following || !this.blocks.length) return this.currentTime
-      const b = this.blocks[this.centerBlock]
-      if (!b) return this.currentTime
-      const cue = this.cues[b.firstSpoken >= 0 ? b.firstSpoken : b.first]
-      return cue ? cue.start : this.currentTime
-    },
-    headerClock() {
-      return formatClock(this.headerTime)
-    },
-    progressFraction() {
-      return this.duration > 0 ? Math.min(1, Math.max(0, this.headerTime / this.duration)) : 0
-    },
-    // Same arithmetic as the player's own "remaining" readout: book time left divided by the playback speed
-    remainingClock() {
-      return formatClock(Math.max(0, this.duration - this.headerTime) / (this.playbackRate || 1))
-    },
-    headerChapter() {
-      const t = this.headerTime
-      const ch = this.chapters.find((c) => Number(c.start) <= t && Number(c.end) > t)
-      return ch ? ch.title : ''
-    }
-  },
-  watch: {
-    centerBlock() {
-      if (this.following) return Math.max(this.activeBlock, 0)
-      return this.selectedBlock
-    },
-    windowIndices() {
-      const out = []
-      for (let i = this.winStart; i < this.winEnd; i++) out.push(i)
-      return out
-    },
-    matchSet() {
-      return new Set(this.matches)
-    },
-    headerButtons() {
-      const buttons = [
-        { id: 'play', icon: this.isPlaying ? 'pause' : 'play_arrow', label: this.$strings.LabelTranscriptPlayPause, action: () => this.$emit('toggle-play') },
-        { id: 'follow', icon: 'my_location', label: this.$strings.LabelTranscriptFollow, disabled: this.following, action: () => this.resumeFollow() },
-        { id: 'smaller', icon: 'text_decrease', label: this.$strings.LabelTranscriptFontSmaller, disabled: this.fontLevel === 0, action: () => this.changeFont(-1) },
-        { id: 'larger', icon: 'text_increase', label: this.$strings.LabelTranscriptFontLarger, disabled: this.fontLevel === FONT_SCALES.length - 1, action: () => this.changeFont(1) },
+        { id: 'night', icon: this.night ? 'light_mode' : 'dark_mode', label: this.night ? this.$strings.LabelReaderDayMode : this.$strings.LabelReaderNightMode, action: () => this.toggleNight() },
         { id: 'search', icon: 'search', label: this.$strings.LabelTranscriptSearch, action: () => this.toggleSearch() }
       ]
       // Result navigation is a pair of header buttons so it stays reachable with the D-pad
@@ -260,10 +211,10 @@ export default {
     this.touchY = null
     this.touchAcc = 0
     try {
-      const stored = parseInt(window.localStorage.getItem(FONT_STORAGE_KEY), 10)
-      if (stored >= 0 && stored < FONT_SCALES.length) this.fontLevel = stored
+      this.fontLevel = loadFontLevel(window.localStorage, FONT_STORAGE_KEY, FONT_LEGACY_KEY)
+      this.night = loadFlag(window.localStorage, NIGHT_KEY, false)
     } catch (e) {
-      // localStorage unavailable: keep the default size
+      // localStorage unavailable: keep the defaults
     }
   },
   mounted() {
@@ -419,7 +370,15 @@ export default {
       if (next === this.fontLevel) return
       this.fontLevel = next
       try {
-        window.localStorage.setItem(FONT_STORAGE_KEY, String(next))
+        saveFontLevel(window.localStorage, FONT_STORAGE_KEY, next)
+      } catch (e) {
+        // ignore: preference simply is not remembered
+      }
+    },
+    toggleNight() {
+      this.night = !this.night
+      try {
+        saveFlag(window.localStorage, NIGHT_KEY, this.night)
       } catch (e) {
         // ignore: preference simply is not remembered
       }
@@ -650,6 +609,16 @@ export default {
   border-color: var(--tv-focus-color, #1ad691);
   background: rgba(255, 255, 255, 0.12);
 }
+@media (max-width: 480px) {
+  /* the longer button row (night mode, scroll mode, ...) must still leave room for the clock: smaller buttons (declared
+     after the base rule so that they win) */
+  .tr-btn {
+    width: 2.1rem;
+    height: 2.1rem;
+    margin-left: 0;
+    font-size: 1.35rem;
+  }
+}
 .tr-search {
   width: 100%;
   padding: 0.4rem 0.75rem;
@@ -669,5 +638,26 @@ export default {
   font-size: 0.75rem;
   opacity: 0.55;
   text-align: center;
+}
+/* Night mode: pure black (OLED friendly) with light grey text; the block colours live in TranscriptBlock.vue */
+.transcript-view.tr-night {
+  background: #000;
+  color: #e6e6e6;
+}
+.tr-night .tr-sub,
+.tr-night .tr-hint,
+.tr-night .text-fg-muted {
+  opacity: 1;
+  color: #b0b0b0;
+}
+.tr-night .tr-search {
+  background: rgba(255, 255, 255, 0.14);
+  color: #e6e6e6;
+}
+.tr-night .tr-search::placeholder {
+  color: #9a9a9a;
+}
+.tr-night .tr-focus {
+  background: rgba(255, 255, 255, 0.18);
 }
 </style>

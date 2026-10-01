@@ -27,8 +27,9 @@ const press = async (k, n = 1) => {
   for (let i = 0; i < n; i++) await page.keyboard.press(k)
 }
 // Moves focus to a header button with the D-pad (Right enters the row; Left/Right walk it) and presses OK
+// (the wide two-pane layout reserves Right for the illustration pane, so the header is entered with Left there)
 const pressHeader = async (id, activate = true) => {
-  await press('ArrowRight')
+  await press((await bk((vm) => vm.twoPane)) ? 'ArrowLeft' : 'ArrowRight')
   await bk((vm) => { vm.headerIdx = 0 })
   const at = await bk((vm, id) => vm.headerButtons.findIndex((b) => b.id === id), id)
   await press('ArrowRight', at)
@@ -134,8 +135,8 @@ await page.waitForTimeout(600)
 const afterOk = await bk((vm) => ({ following: vm.following, anchor: vm.anchorT }))
 check('OK seeks to the first spoken word of the focused paragraph and resumes following', afterOk.following === true && Math.abs(afterOk.anchor - target.t) < 1.5, JSON.stringify({ target, afterOk }))
 // header navigation
-await press('ArrowRight')
-check('Right moves to the header row', (await bk((vm) => vm.zone)) === 'header')
+await press('ArrowLeft')
+check('Left moves to the header row', (await bk((vm) => vm.zone)) === 'header')
 await press('ArrowRight', 2)
 await press('ArrowLeft')
 await press('ArrowDown')
@@ -155,12 +156,14 @@ const wch = fx.widget.chapter - 1
 await bk((vm, c) => vm.seekToTime(c), ch[wch].startSec + 2)
 await page.waitForFunction((c) => window.__vm('book').viewChapter === c, wch, { timeout: 30000 })
 await sleep(800)
-await bk((vm) => {
-  const i = vm.items.findIndex((it) => it.kind === 'widget')
-  vm.following = false
-  vm.select(i)
-})
+// wide layout: the widget lives in the right pane (the text flow has none); it appears with the paragraph after it
+await bk((vm) => { vm.following = false })
+await bk(async (vm, afterId) => {
+  const el = vm.doc.getElementById(afterId)
+  vm.select(vm.itemIndex.get(el.closest('p')))
+}, fx.illustrations.find((i) => i.kind === 'widget').firstWordIdAfter)
 await sleep(2500)
+check('the widget is in the pane, not in the text flow', (await bk((vm) => vm.paneItem && vm.paneItem.kind)) === 'widget' && (await bk((vm) => vm.doc.querySelectorAll('.abs-widget').length)) === 0)
 const wf = page.frames().find((f) => /epub-vfs/.test(f.url()))
 check('widget iframe goes live from the virtual file system once scrolled near', !!wf, wf ? wf.url() : '')
 if (wf) {
@@ -177,6 +180,8 @@ await shot('book-05-widget-inline')
 const wasPlaying = await playing()
 if (!wasPlaying) await bk((vm) => { vm.$emit('toggle-play') })
 await sleep(600)
+await press('ArrowRight')
+check('Right from the text moves focus to the pane', (await bk((vm) => vm.zone)) === 'pane')
 await press('Enter')
 await page.waitForSelector('.bk-wfull iframe', { timeout: 10000 })
 await sleep(2000)
@@ -231,7 +236,7 @@ await pressHeader('mode')
 await page.waitForSelector('.tr-block', { timeout: 30000 })
 check('mode switch opens the transcript viewer (VTT fallback keeps working)', (await page.locator('.bk-frame').count()) === 0)
 await shot('book-08-vtt-fallback')
-await page.keyboard.press('ArrowRight')
+await page.keyboard.press('ArrowLeft')
 const tmIdx = await page.evaluate(() => {
   const walk = (c) => [c, ...c.$children.flatMap(walk)]
   const vm = walk(window.$nuxt).find((c) => c.$options.computed && c.$options.computed.headerButtons && !(c.$options.methods && c.$options.methods.tapWidget))

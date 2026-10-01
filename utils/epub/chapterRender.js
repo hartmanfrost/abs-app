@@ -95,15 +95,45 @@ span.abs-find{background:rgba(26,214,145,.4);border-radius:.14em}
 .abs-widget iframe.abs-w-live{position:absolute;left:0;top:0;border:0;transform-origin:0 0;background:#fff;pointer-events:none}
 .abs-hidden{display:none!important}
 .abs-dropcap-letter{float:left;display:block;line-height:1;margin:0;padding:0 .08em 0 0}
+.abs-ill{display:block;box-sizing:border-box;width:.8em;height:.8em;margin:.3em auto;border:.12em solid currentColor;border-radius:.2em;opacity:.35}
+${nightCss(activeClass)}`
+}
+
+/**
+ * Night mode: light text on black, switched by the `abs-night` class on <html> so that toggling needs no rebuild. The book's
+ * colours are overridden (including -webkit-text-fill-color, which iBooks exports like to set); illustrations are not
+ * touched. The active word becomes a solid amber block with black text: light text on a translucent amber would be weak.
+ */
+export function nightCss(activeClass) {
+  const act = `[class~="${activeClass}"]`
+  const text = '#e8e8e8'
+  const accent = '#ffd27a'
+  return `
+html.abs-night{background:#000!important;color:${text};color-scheme:dark}
+html.abs-night body{background:#000!important}
+html.abs-night body,html.abs-night body *{color:${text}!important;-webkit-text-fill-color:${text}!important;background-color:transparent!important;border-color:#777!important;text-shadow:none!important}
+html.abs-night h1,html.abs-night h2,html.abs-night h3,html.abs-night h4,html.abs-night h5,html.abs-night h6,html.abs-night h1 *,html.abs-night h2 *,html.abs-night h3 *,html.abs-night h4 *,html.abs-night h5 *,html.abs-night h6 *{color:#fff!important;-webkit-text-fill-color:#fff!important}
+html.abs-night body *::first-letter{color:#fff!important;-webkit-text-fill-color:#fff!important}
+html.abs-night body .abs-dropcap-letter,html.abs-night body .abs-dropcap-letter *{color:${accent}!important;-webkit-text-fill-color:${accent}!important}
+html.abs-night body span${act}{background-color:#ffc400!important;box-shadow:0 0 0 .09em #ffc400;color:#000!important;-webkit-text-fill-color:#000!important}
+html.abs-night body span${act}::first-letter{color:#000!important;-webkit-text-fill-color:#000!important}
+html.abs-night body span.abs-find{background-color:#1ad691!important;color:#000!important;-webkit-text-fill-color:#000!important}
+html.abs-night body .abs-widget .abs-w-badge{background-color:rgba(0,0,0,.55)!important;color:#fff!important;-webkit-text-fill-color:#fff!important}
+html.abs-night body .abs-widget iframe.abs-w-live{background-color:#fff!important}
 `
 }
 
 /**
  * @param {import('./epubBook.js').EpubBook} book
  * @param {number} chapterIdx
- * @returns {Promise<{html:string, widgets:Array, images:number, dropcaps:Array}>}
+ * @param {{extractIllustrations?:boolean, illustrationsOnly?:boolean}} [opts] extractIllustrations: take every
+ *   illustration (images, SVG images, widgets) out of the text flow, leaving a small marker, and list them in
+ *   `illustrations` (document order); illustrationsOnly: skip styles and serialisation, only list the illustrations
+ * @returns {Promise<{html:string, widgets:Array, images:number, dropcaps:Array, illustrations:Array}>}
  */
-export async function buildChapterHtml(book, chapterIdx) {
+export async function buildChapterHtml(book, chapterIdx, opts = {}) {
+  const only = !!opts.illustrationsOnly
+  const extract = !!opts.extractIllustrations || only
   const ch = book.chapters[chapterIdx]
   const raw = await book.text(ch.href)
   let doc = new DOMParser().parseFromString(raw, 'application/xhtml+xml')
@@ -119,7 +149,7 @@ export async function buildChapterHtml(book, chapterIdx) {
   const cssChunks = []
   let dropcapRules = []
   const pending = []
-  const sheets = Array.from(doc.querySelectorAll('link[rel~="stylesheet"], link[type="text/css"]'))
+  const sheets = only ? [] : Array.from(doc.querySelectorAll('link[rel~="stylesheet"], link[type="text/css"]'))
   sheets.forEach((link, i) => {
     const href = link.getAttribute('href')
     if (!href || isExternalUrl(href)) return
@@ -136,7 +166,7 @@ export async function buildChapterHtml(book, chapterIdx) {
         .catch(() => {})
     )
   })
-  const styleEls = Array.from(doc.querySelectorAll('style'))
+  const styleEls = only ? [] : Array.from(doc.querySelectorAll('style'))
   styleEls.forEach((st, i) => {
     const css = st.textContent || ''
     pending.push(
@@ -212,22 +242,115 @@ export async function buildChapterHtml(book, chapterIdx) {
     widgets.push({ index: idx, bundle: book.resolve(ch.href, bundle), start, stageW: stage ? stage.w : 0, stageH: stage ? stage.h : 0, title: title || '' })
   })
 
-  // ---- images: resolved lazily after the document is shown ----
+  // ---- images: resolved lazily after the document is shown (<img src> and SVG <image href>) ----
   let images = 0
-  doc.querySelectorAll('img').forEach((img) => {
-    const src = img.getAttribute('src')
+  doc.querySelectorAll('img, image').forEach((img) => {
+    const isSvg = img.localName === 'image'
+    const src = isSvg ? img.getAttribute('href') || img.getAttribute('xlink:href') : img.getAttribute('src')
     if (!src || isExternalUrl(src)) return
     const p = book.resolve(ch.href, src)
     if (!book.has(p)) return
-    img.removeAttribute('src')
+    if (isSvg) {
+      img.removeAttribute('href')
+      img.removeAttribute('xlink:href')
+    } else img.removeAttribute('src')
     img.setAttribute('data-abs-src', p)
     images++
   })
 
+  const illustrations = extract ? extractIllustrations(doc, make, widgets, chapterIdx) : []
+  if (only) return { html: '', widgets, images, dropcaps: [], illustrations }
+
   let html = new XMLSerializer().serializeToString(doc)
   html = html.replace(/^<\?xml[^>]*\?>\s*/, '')
   html = '<!DOCTYPE html>' + html
-  return { html, widgets, images, dropcaps: dropcapRules }
+  return { html, widgets, images, dropcaps: dropcapRules, illustrations }
+}
+
+const TEXT_BLOCKS = 'p,li,h1,h2,h3,h4,h5,h6,blockquote,td,th,dd,dt,figcaption,pre'
+const ORNAMENT_MAX = 90 // images declared smaller than this (px) in either direction are text ornaments, not illustrations
+const MARK = 'abs-ill'
+
+const lengthPx = (el, name) => {
+  const a = parseFloat(el.getAttribute(name))
+  if (a > 0) return a
+  const m = new RegExp('(?:^|;)\\s*' + name + '\\s*:\\s*([\\d.]+)px', 'i').exec(el.getAttribute('style') || '')
+  return m ? parseFloat(m[1]) : 0
+}
+
+/** A small inline picture inside running text (glyph, flourish, icon) stays where it is. */
+export function isOrnament(img) {
+  const w = lengthPx(img, 'width')
+  const h = lengthPx(img, 'height')
+  if ((w && w < ORNAMENT_MAX) || (h && h < ORNAMENT_MAX)) return true
+  if (w || h) return false
+  // Unknown size: a picture standing in a block of its own is an illustration, one among words is an ornament
+  const block = img.closest(TEXT_BLOCKS)
+  return !!(block && block.querySelector('[id^="w"]'))
+}
+
+/** Highest ancestor (or the node itself) whose only content is `node`: that is what leaves the text flow. */
+function wrapperOf(node, doc) {
+  let c = node
+  while (c.parentElement && c.parentElement !== doc.documentElement && c.parentElement.localName !== 'body') {
+    const p = c.parentElement
+    const other = Array.from(p.childNodes).some((n) => n !== c && ((n.nodeType === 1 && n.localName !== 'br') || (n.nodeType === 3 && n.nodeValue.trim())))
+    if (other) break
+    c = p
+  }
+  return c
+}
+
+/**
+ * Replaces every illustration with a small marker and describes it. Narrated text (anything holding word spans, such as a
+ * caption) is never removed: only the picture and wrappers that hold nothing else.
+ * @returns {Array<{kind:'img'|'widget', path:string, w:number, h:number, alt:string, widget:object|null, chapter:number, index:number}>}
+ */
+export function extractIllustrations(doc, make, widgets, chapterIdx) {
+  const out = []
+  const nodes = Array.from(doc.querySelectorAll('.abs-widget, img, svg'))
+  const done = new Set()
+  for (const node of nodes) {
+    if (done.has(node) || !node.parentNode) continue
+    let desc = null
+    if (node.classList && node.classList.contains('abs-widget')) {
+      const spec = widgets[parseInt(node.getAttribute('data-abs-w'), 10)]
+      if (!spec) continue
+      const thumb = node.querySelector('img.abs-w-thumb')
+      desc = { kind: 'widget', path: (thumb && thumb.getAttribute('data-abs-src')) || '', w: thumb ? lengthPx(thumb, 'width') : 0, h: thumb ? lengthPx(thumb, 'height') : 0, alt: spec.title || '', widget: spec }
+    } else if (node.localName === 'svg') {
+      if (node.closest('.abs-widget')) continue
+      const image = node.querySelector('image[data-abs-src]')
+      if (!image) continue
+      node.querySelectorAll('image').forEach((n) => done.add(n))
+      let w = lengthPx(node, 'width')
+      let h = lengthPx(node, 'height')
+      const vb = (node.getAttribute('viewBox') || '')
+        .trim()
+        .split(/[\s,]+/)
+        .map(parseFloat)
+      if ((!w || !h) && vb.length === 4 && vb[2] > 0 && vb[3] > 0) {
+        w = vb[2]
+        h = vb[3]
+      }
+      desc = { kind: 'img', path: image.getAttribute('data-abs-src'), w, h, alt: node.getAttribute('aria-label') || '', widget: null }
+    } else {
+      if (node.closest('.abs-widget') || node.closest('svg') || !node.getAttribute('data-abs-src')) continue
+      if (isOrnament(node)) continue
+      desc = { kind: 'img', path: node.getAttribute('data-abs-src'), w: lengthPx(node, 'width'), h: lengthPx(node, 'height'), alt: node.getAttribute('alt') || '', widget: null }
+    }
+    const wrap = wrapperOf(node, doc)
+    wrap.querySelectorAll('.abs-widget, img, svg').forEach((n) => done.add(n))
+    desc.chapter = chapterIdx
+    desc.index = out.length
+    const mark = make('span')
+    mark.setAttribute('class', MARK)
+    mark.setAttribute('data-abs-ill', String(desc.index))
+    mark.setAttribute('aria-hidden', 'true')
+    wrap.parentNode.replaceChild(mark, wrap)
+    out.push(desc)
+  }
+  return out
 }
 
 /**
@@ -237,14 +360,14 @@ export async function buildChapterHtml(book, chapterIdx) {
  */
 export function hydrateChapter(doc, book, dropcaps) {
   let cancelled = false
-  const imgs = Array.from(doc.querySelectorAll('img[data-abs-src]'))
+  const imgs = Array.from(doc.querySelectorAll('img[data-abs-src], image[data-abs-src]'))
   let next = 0
   const worker = async () => {
     while (!cancelled && next < imgs.length) {
       const img = imgs[next++]
       try {
         const url = await book.blobUrl(img.getAttribute('data-abs-src'))
-        if (!cancelled) img.setAttribute('src', url)
+        if (!cancelled) img.setAttribute(img.localName === 'image' ? 'href' : 'src', url)
       } catch (e) {
         // a missing image just stays blank
       }

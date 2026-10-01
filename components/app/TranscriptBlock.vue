@@ -165,4 +165,55 @@ export default {
   background: none;
   box-shadow: none;
 }
+/*
+ * Night mode (the .tr-night class sits on the Transcript view root). Solid colours instead of opacity so every
+ * state stays >= 7:1 on pure black: idle text #b0b0b0, unspoken #9a9a9a, current block #e6e6e6, the word being
+ * read is black on amber.
+ */
+.tr-night .tr-block {
+  color: #b0b0b0;
+}
+.tr-night .tr-heading {
+  color: #e6e6e6;
+}
+.tr-night .tr-active {
+  color: #e6e6e6;
+}
+.tr-night .tr-legacy {
+  opacity: 1;
+  color: #a8a8a8;
+}
+.tr-night .tr-legacy.tr-active {
+  color: #e6e6e6;
+}
+.tr-night .tr-selected {
+  border-left-color: #ffd54a;
+  background: rgba(255, 255, 255, 0.12);
+}
+.tr-night .tr-para .tr-cur,
+.tr-night .tr-heading .tr-cur {
+  background: rgba(255, 190, 0, 0.22);
+}
+.tr-night .tr-un {
+  opacity: 1;
+  color: #9a9a9a;
+}
+.tr-night .tr-match {
+  text-decoration-color: #ffd54a;
+  text-decoration-thickness: 0.12em;
+}
+.tr-night .tr-legacy .tr-word-todo {
+  opacity: 1;
+  color: #b0b0b0;
+}
+.tr-night .tr-word-now {
+  color: #000;
+  background: #ffd54a;
+  box-shadow: 0 0 0 0.08em #ffd54a;
+}
+.tr-night .tr-legacy .tr-word-now {
+  color: #ffd54a;
+  background: none;
+  box-shadow: none;
+}
 </style>
