@@ -286,3 +286,37 @@ test('a throwing or missing storage never throws and yields defaults', () => {
   assert.doesNotThrow(() => saveFlag(undefined, 'k', true))
   assert.equal(loadFlag(undefined, 'k'), false)
 })
+
+// ---- decideIllustration: the pane must hold while there is no reading position (regression of the vc121 flip)
+import { decideIllustration } from '../utils/epub/readAlong.js'
+
+test('decideIllustration: no position holds unless forced', () => {
+  const base = { positions: [5, 20], hasCarry: true, current: { source: 'chapter', index: 1 } }
+  assert.equal(decideIllustration({ ...base, pos: -1, force: false }), null)
+  assert.deepEqual(decideIllustration({ ...base, pos: -1, force: true }), { source: 'carry' })
+})
+
+test('decideIllustration: playback never moves the pane backwards, a forced seek may', () => {
+  const base = { positions: [5, 20], hasCarry: true, current: { source: 'chapter', index: 1 } }
+  assert.equal(decideIllustration({ ...base, pos: 10, force: false }), null)
+  assert.equal(decideIllustration({ ...base, pos: 2, force: false }), null)
+  assert.deepEqual(decideIllustration({ ...base, pos: 10, force: true }), { source: 'chapter', index: 0 })
+  assert.deepEqual(decideIllustration({ ...base, pos: 25, force: false }), { source: 'chapter', index: 1 })
+})
+
+test('decideIllustration: simulated playback with gaps and unspoken runs is monotonic', () => {
+  const positions = [10, 40, 90]
+  let current = null
+  const shown = []
+  // 120 words; every 7th tick has no active word (gap), runs of 5 unspoken words repeat
+  for (let pos = 0; pos < 120; pos++) {
+    for (const p of [pos, -1, -1]) {
+      const d = decideIllustration({ positions, pos: p, hasCarry: true, current, force: false })
+      if (d) {
+        current = d
+        shown.push(d.source === 'chapter' ? d.index : 'carry')
+      }
+    }
+  }
+  assert.deepEqual(shown.filter((x, i) => x !== shown[i - 1]), ['carry', 0, 1, 2])
+})

@@ -127,7 +127,7 @@ html.abs-night body .abs-widget iframe.abs-w-live{background-color:#fff!importan
 /**
  * @param {import('./epubBook.js').EpubBook} book
  * @param {number} chapterIdx
- * @param {{extractIllustrations?:boolean, illustrationsOnly?:boolean}} [opts] extractIllustrations: take every
+ * @param {{extractIllustrations?:boolean, illustrationsOnly?:boolean, night?:boolean}} [opts] extractIllustrations: take every
  *   illustration (images, SVG images, widgets) out of the text flow, leaving a small marker, and list them in
  *   `illustrations` (document order); illustrationsOnly: skip styles and serialisation, only list the illustrations
  * @returns {Promise<{html:string, widgets:Array, images:number, dropcaps:Array, illustrations:Array}>}
@@ -143,6 +143,8 @@ export async function buildChapterHtml(book, chapterIdx, opts = {}) {
   }
   const ns = doc.documentElement.namespaceURI || XHTML_NS
   const make = (name) => doc.createElementNS(ns, name)
+  // Night mode is decided before the document exists: the class is in the markup, so no light frame is ever painted
+  if (opts.night && !only) doc.documentElement.setAttribute('class', ((doc.documentElement.getAttribute('class') || '') + ' abs-night').trim())
   const head = doc.querySelector('head') || doc.documentElement.insertBefore(make('head'), doc.documentElement.firstChild)
   const body = doc.querySelector('body')
 

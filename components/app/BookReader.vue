@@ -26,7 +26,7 @@
     <!-- Body: the chapter lives in an isolated iframe document with the book's own CSS; it is scaled as a whole for 10-foot viewing -->
     <div ref="body" class="bk-body relative flex-1 overflow-hidden flex" :class="{ 'bk-swapped': swapped }">
       <div ref="col" class="bk-col relative">
-        <iframe ref="frame" class="bk-frame" :class="{ 'bk-frame-hidden': status !== 'ready' }" :style="frameStyle" tabindex="-1" title="Book"></iframe>
+        <iframe ref="frame" class="bk-frame" :class="{ 'bk-frame-hidden': status !== 'ready' || swapping }" :style="frameStyle" tabindex="-1" title="Book"></iframe>
       </div>
       <!-- Right third (wide screens): the illustration that belongs to the reading position, sticky until the next one -->
       <div v-if="twoPane" ref="pane" class="bk-pane relative" :class="{ 'bk-pane-focus': zone === 'pane' }" role="img" :aria-label="(paneItem && paneItem.alt) || $strings.LabelReaderIllustration" @click.stop="openPane">
@@ -53,7 +53,7 @@
 
     <!-- Fullscreen interactive widget -->
     <div v-if="widgetOpen" class="bk-wfull" @click.stop>
-      <div class="bk-wstage" :style="widgetStageStyle">
+      <div class="bk-wstage" :class="{ 'bk-wloaded': widgetOpen.loaded }" :style="widgetStageStyle">
         <iframe v-if="widgetOpen.src" ref="wframe" :src="widgetOpen.src" class="bk-wframe" allow="autoplay; fullscreen" tabindex="-1" @load="onWidgetLoad"></iframe>
         <img v-else-if="widgetOpen.thumb" :src="widgetOpen.thumb" class="bk-wthumb" alt="" />
         <div v-if="widgetOpen.src && isTv" class="bk-pointer" :style="{ left: pointer.x + 'px', top: pointer.y + 'px' }"></div>
@@ -70,7 +70,7 @@ import { openBookFor } from '@/utils/epub/epubBook'
 import { buildChapterHtml, hydrateChapter } from '@/utils/epub/chapterRender'
 import { ensureVfs, mountBook, unmountBook, vfsUrl } from '@/utils/epub/vfs'
 import { formatClock } from '@/utils/transcript'
-import { positionsFromOrder, selectIllustration, lineKeypoints, scrollYAt, easeToward, ClockSmoother } from '@/utils/epub/readAlong'
+import { positionsFromOrder, decideIllustration, lineKeypoints, scrollYAt, easeToward, ClockSmoother } from '@/utils/epub/readAlong'
 import { FONT_SCALES, DEFAULT_FONT_LEVEL, NIGHT_KEY, SMOOTH_KEY, SWAP_KEY, loadFontLevel, saveFontLevel, loadFlag, saveFlag } from '@/utils/readerPrefs'
 import playbackClock from '@/mixins/playbackClock'
 import { enterReader, leaveReader } from '@/utils/readerFlag'
@@ -103,6 +103,7 @@ export default {
       status: 'loading', // loading | ready | error | unsynced
       progress: 0,
       chapterLoading: false,
+      swapping: false, // the frame is hidden while a new chapter document loads and is positioned (the page background shows instead)
       zone: 'list', // list | header | pane
       headerIdx: 0,
       following: true,
@@ -278,6 +279,8 @@ export default {
     this.wordOrd = new Map() // word element -> ordinal in the chapter
     this.carry = null // last illustration of the chapters before the displayed one
     this.carryPending = false
+    this.paneSel = null // { source, index } of what the pane shows
+    this.paneForce = false
     this.carryCache = new Map() // chapter index -> its last illustration (or null)
     this.paneLiveTimer = null
     this.paneLive = null
@@ -392,11 +395,12 @@ export default {
       this.chapterLoading = !initial
       try {
         const wide = this.twoPane
-        const built = await buildChapterHtml(book, idx, { extractIllustrations: wide })
+        const built = await buildChapterHtml(book, idx, { extractIllustrations: wide, night: this.night })
         if (token !== this.loadToken) return false
         const smil = await book.timeline.smilFor(idx)
         if (token !== this.loadToken) return false
         const frame = this.$refs.frame
+        this.swapping = true
         await new Promise((resolve) => {
           frame.addEventListener('load', resolve, { once: true })
           frame.srcdoc = built.html
@@ -432,8 +436,12 @@ export default {
         this.selTime = -1
         this.win.scrollTo(0, 0)
         this.scheduleLive()
+        this.paneSel = null
+        this.paneForce = true
         this.resolveCarry(idx, token)
         this.updatePane()
+        // position on the reading point before the frame is revealed
+        if (this.following) this.tick()
         this.syncSmooth()
         return true
       } catch (error) {
@@ -441,7 +449,11 @@ export default {
         if (token === this.loadToken && initial) throw error
         return false
       } finally {
-        if (token === this.loadToken) this.chapterLoading = false
+        if (token === this.loadToken) {
+          this.chapterLoading = false
+          // reveal once styled, laid out and scrolled (a failed load must not leave the page blank either)
+          this.$nextTick(() => requestAnimationFrame(() => (this.swapping = false)))
+        }
       }
     },
     attach() {
@@ -758,13 +770,20 @@ export default {
       const o = el ? this.wordOrd.get(el) : undefined
       return o === undefined ? -1 : o
     },
-    updatePane() {
+    // Moves the pane only when the reading position crosses an illustration boundary (see decideIllustration): between words,
+    // in unspoken runs and in gaps there is no position and the pane holds. `force`: explicit seek / browse / chapter load.
+    updatePane(force = false) {
       if (!this.twoPane || !this.doc) return
-      const sel = selectIllustration(this.illusPos, this.currentPos(), !!this.carry)
+      const f = force || this.paneForce
+      const pos = this.currentPos()
+      const d = decideIllustration({ positions: this.illusPos, pos, hasCarry: !!this.carry, current: this.paneSel, force: f })
+      if (!d) return
       let desc = null
-      if (sel.source === 'chapter') desc = this.illus[sel.index]
-      else if (sel.source === 'carry') desc = this.carry
+      if (d.source === 'chapter') desc = this.illus[d.index]
+      else if (d.source === 'carry') desc = this.carry
       else if (this.carryPending && this.paneItem) return // keep what is shown until the previous chapters have been looked at
+      this.paneSel = d
+      if (pos >= 0) this.paneForce = false
       this.setPane(desc)
     },
     setPane(desc) {
@@ -826,6 +845,7 @@ export default {
         if (token === this.loadToken) {
           this.carryPending = false
           this.updatePane()
+          this.paneForce = false
         }
       }
     },
@@ -886,7 +906,7 @@ export default {
       // Same as a widget: the audiobook pauses while the illustration is open and resumes on Back
       this.wasPlayingBeforeWidget = this.isPlaying
       if (this.isPlaying) this.$emit('toggle-play')
-      this.widgetOpen = { index: -1, w, h, src: '', thumb: it.src, still: true }
+      this.widgetOpen = { index: -1, w, h, src: '', thumb: it.src, still: true, loaded: true }
       this.$nextTick(() => this.$refs.root && this.$refs.root.focus({ preventScroll: true }))
     },
 
@@ -902,7 +922,7 @@ export default {
       this.selEl = it.el
       it.el.classList.add('abs-sel')
       this.selTime = this.itemTime(it)
-      this.updatePane()
+      this.updatePane(true)
       this.scrollToItemEl(it.el, true)
       this.scheduleLive()
     },
@@ -953,6 +973,7 @@ export default {
       this.select(next)
     },
     resumeFollow() {
+      this.paneForce = true
       this.following = true
       this.zone = 'list'
       if (this.selEl) this.selEl.classList.remove('abs-sel')
@@ -966,6 +987,7 @@ export default {
       if (!(t >= 0)) return
       this.markSeek(t)
       this.$emit('seek', t)
+      this.paneForce = true
       this.following = true
       this.zone = 'list'
       if (this.selEl) this.selEl.classList.remove('abs-sel')
@@ -973,6 +995,8 @@ export default {
       this.selTime = -1
       this.lastPar = -1
       this.tick()
+      // an explicit seek may move the pane anywhere (also to the chapter-start state while no word is active yet)
+      if (!this.relocating) this.updatePane(true)
     },
     seekToWord(el) {
       const par = parForId(this.smil, el.id)
@@ -1075,7 +1099,7 @@ export default {
       const w = spec.stageW || 1024
       const h = spec.stageH || 768
       this.pointer = { x: w / 2, y: h / 2 }
-      this.widgetOpen = { index, w, h, src: this.vfsOk ? vfsUrl(this.sid, spec.bundle + '/' + spec.start, 'live') : '', thumb: thumbSrc || '' }
+      this.widgetOpen = { index, w, h, src: this.vfsOk ? vfsUrl(this.sid, spec.bundle + '/' + spec.start, 'live') : '', thumb: thumbSrc || '', loaded: false }
       this.$nextTick(() => this.$refs.root && this.$refs.root.focus({ preventScroll: true }))
     },
     closeWidget() {
@@ -1098,6 +1122,7 @@ export default {
     onWidgetLoad() {
       const f = this.$refs.wframe
       if (!f || !f.contentWindow) return
+      if (this.widgetOpen) this.widgetOpen.loaded = true
       f.contentWindow.postMessage({ abs: 'mute', value: false }, '*')
       f.contentWindow.postMessage({ abs: 'enter' }, '*')
       // Keep D-pad focus in the reader, the frame would swallow the keys
@@ -1565,6 +1590,18 @@ export default {
 .bk-night .bk-body,
 .bk-night .bk-frame {
   background: #000;
+}
+.bk-night .bk-wstage {
+  background: #000;
+}
+.bk-night .bk-wstage.bk-wloaded {
+  background: #fff;
+}
+.bk-night .bk-wframe {
+  opacity: 0;
+}
+.bk-night .bk-wloaded .bk-wframe {
+  opacity: 1;
 }
 .bk-night .bk-pane {
   background: #000;

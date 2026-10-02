@@ -77,3 +77,61 @@ export const vmEval = (page, pred, fn) =>
     },
     [pred.toString(), fn.toString()]
   )
+
+/**
+ * Drives the Book reader's clock synthetically (no audio needed) from the start of book chapter `from` to the start of
+ * chapter `to` plus a minute, ticking every `step` seconds like the 100 ms tick of the reader, and records every change of the
+ * illustration pane: [[time, viewChapter, paneKey|null], ...]. Also counts how many <img>/<iframe> nodes were mounted in the pane (re-mounts on an unchanged selection show up here).
+ * Needs window.__vm() to return the BookReader instance.
+ */
+export const simulatePlayback = (page, from, to, step = 0.1) =>
+  page.evaluate(
+    async ([from, to, step]) => {
+      const vm = window.__vm()
+      const smooth = vm.smooth
+      vm.smooth = false
+      if (vm.isPlaying) vm.$emit('toggle-play')
+      await new Promise((r) => setTimeout(r, 300))
+      const first = (await vm.book.timeline.smilFor(from)).firstStart
+      const last = (await vm.book.timeline.smilFor(to)).firstStart
+      window.__T = first - 2
+      window.__origEstimate = vm.estimateTime
+      vm.estimateTime = () => window.__T
+      vm.seekToTime(first - 2)
+      await new Promise((r) => setTimeout(r, 1500))
+      let mounts = 0
+      const pane = document.querySelector('.bk-pane')
+      new MutationObserver((ms) => ms.forEach((m) => m.addedNodes.forEach((n) => (n.tagName === 'IFRAME' || n.tagName === 'IMG') && mounts++))).observe(pane, { childList: true, subtree: true })
+      const seq = []
+      let lastKey
+      for (let t = first - 2; t < last + 60; t += step) {
+        window.__T = t
+        vm.tick()
+        let spin = 0
+        while (vm.relocating && spin++ < 300) await new Promise((r) => setTimeout(r, 10))
+        if (spin) await new Promise((r) => setTimeout(r, 30))
+        const k = vm.paneItem ? vm.paneItem.key : null
+        if (k !== lastKey) {
+          seq.push([+t.toFixed(1), vm.viewChapter, k])
+          lastKey = k
+        }
+        if (!(Math.round(t * 10) % 2000)) await new Promise((r) => setTimeout(r, 0))
+      }
+      await new Promise((r) => setTimeout(r, 800))
+      vm.estimateTime = window.__origEstimate
+      vm.smooth = smooth
+      return { seq, mounts }
+    },
+    [from, to, step]
+  )
+
+/** "c:i" keys must never go backwards, and once something is shown the pane never goes empty. */
+export const paneFlips = (seq) => {
+  const flips = []
+  let prev = null
+  for (const [t, ch, k] of seq) {
+    if (prev !== null && (k === null || k.split(':').map(Number).reduce((a, b, i) => a + (i === 0 ? b * 1e4 : b), 0) < prev.split(':').map(Number).reduce((a, b, i) => a + (i === 0 ? b * 1e4 : b), 0))) flips.push([t, ch, k, 'after', prev])
+    if (k !== null) prev = k
+  }
+  return flips
+}

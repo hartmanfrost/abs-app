@@ -2,7 +2,7 @@
 // mode against the local ABS stack and the synthetic synced EPUB (invented content only).
 //   test/e2e/stack.sh up && node test/e2e/book-illus.mjs [screenshotDir]
 // Runs at 1920x1080 (TV output) and 960x540 (the Streamer's CSS viewport) with the D-pad, then at phone size (390x844, touch).
-import { open, openItem, fixture } from './lib.mjs'
+import { open, openItem, fixture, simulatePlayback, paneFlips } from './lib.mjs'
 import { mkdirSync } from 'node:fs'
 
 const shots = process.argv[2] || '/tmp/abs-e2e/shots121'
@@ -147,6 +147,16 @@ for (const [W, H] of [[1920, 1080], [960, 540]]) {
   check('...carried from chapter 2', r3.item && r3.item.key.startsWith('1:'), r3.item && r3.item.key)
   await probe('seeking back into chapter 1 between A and B shows A again', 0, A.firstWordIdAfter, 1, A.path, 'img', 3)
   void rA
+
+  // ---- regression (vc121 bug): during real playback ticks - words, unspoken runs, gaps, chapter switches - the pane
+  // changes only when an illustration boundary is crossed and never flips back to a carried-over / earlier illustration
+  const sim = await simulatePlayback(page, 0, 2)
+  const keys = sim.seq.map((s) => s[2]).filter((k) => k !== null)
+  check('playback ticks over the whole book: the pane sequence is exactly A, B, W, C, D (each once, in order, none stale from before)', JSON.stringify(keys) === JSON.stringify(['0:0', '0:1', '1:0', '1:1', '1:2']), JSON.stringify(sim.seq))
+  check('...and it never flips back or goes empty after showing something', paneFlips(sim.seq).length === 0, JSON.stringify(paneFlips(sim.seq)))
+  await bk((vm) => { if (!vm.isPlaying) vm.$emit('toggle-play') })
+  await sleep(800)
+  check('...and the picture / frame is mounted once per selection, never re-created for an unchanged one', sim.mounts <= keys.length + 1, `${sim.mounts} mounts for ${keys.length} selections`)
 
   // ---- pane geometry: the picture fits the third
   await probe('A again for geometry', 0, A.firstWordIdAfter, 1, A.path, 'img', 3)
@@ -391,6 +401,40 @@ for (const [W, H] of [[1920, 1080], [960, 540]]) {
   // chapter switch keeps night
   await probe('night survives a chapter switch', 0, A.firstWordIdAfter, 1, A.path, 'img', 1)
   check('night: the new chapter document is dark too', await S.frame().evaluate(() => document.documentElement.classList.contains('abs-night')))
+  // ---- regression: no light frame while a chapter switches in night mode (the new document used to paint in day colours first)
+  const lum = (buf) =>
+    page.evaluate(async (b64) => {
+      const bmp = await createImageBitmap(await (await fetch('data:image/jpeg;base64,' + b64)).blob())
+      const c = document.createElement('canvas')
+      c.width = bmp.width
+      c.height = bmp.height
+      const x = c.getContext('2d')
+      x.drawImage(bmp, 0, 0)
+      const d = x.getImageData(0, 0, c.width, c.height).data
+      let sum = 0
+      let n = 0
+      for (let i = 0; i < d.length; i += 16) {
+        sum += d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11
+        n++
+      }
+      return sum / n
+    }, buf.toString('base64'))
+  const clip = { x: 0, y: Math.round(H * 0.1), width: Math.round(W * 0.6), height: Math.round(H * 0.8) }
+  let brightest = 0
+  let frames = 0
+  for (const [target, fromWord] of [[1, fx.chapters[1].firstSpokenId], [2, fx.chapters[2].firstSpokenId], [0, fx.chapters[0].firstSpokenId]]) {
+    const t = await S.timeOf(target, fromWord, 1)
+    await bk((vm, t) => vm.seekToTime(t), t + 0.3)
+    const t0 = Date.now()
+    while (Date.now() - t0 < 3500) {
+      const buf = await page.screenshot({ type: 'jpeg', quality: 40, clip })
+      brightest = Math.max(brightest, await lum(buf))
+      frames++
+    }
+    await page.waitForFunction((c) => window.__vm().viewChapter === c, target, { timeout: 30000 })
+  }
+  check('night: no light frame while chapters switch (document is dark from the first paint)', frames > 15 && brightest < 80, `${frames} frames, brightest mean luminance ${brightest.toFixed(1)}`)
+  check('night: the chapter markup itself carries the night class', (await bk((vm) => vm.$refs.frame.srcdoc.includes('abs-night'))) === true)
   await S.header('night')
   check('day mode restores', !(await S.frame().evaluate(() => document.documentElement.classList.contains('abs-night'))) && (await bk(() => window.localStorage.getItem('absReaderNight'))) === '0')
   await S.shot('day-text')

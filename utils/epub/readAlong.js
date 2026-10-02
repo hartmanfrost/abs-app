@@ -53,6 +53,24 @@ export function selectIllustration(positions, pos, hasCarry) {
   return hasCarry ? { source: 'carry' } : { source: 'none' }
 }
 
+/**
+ * What the illustration pane should do for one reading-position update. Returns null to HOLD what is shown.
+ *  - No position (pos < 0: between two words, an unspoken run, a gap): hold, unless `force` (an explicit seek, browse or a
+ *    chapter load) asks for the chapter-start state.
+ *  - During plain playback the pane never moves backwards (a lower illustration in the same chapter, or the carry-over / empty
+ *    state replacing a chapter illustration): only an explicit `force` may.
+ * @param {{positions:number[], pos:number, hasCarry:boolean, current:{source:string,index?:number}|null, force:boolean}} a
+ */
+export function decideIllustration({ positions, pos, hasCarry, current, force }) {
+  if (!(pos >= 0)) return force ? selectIllustration(positions, -1, hasCarry) : null
+  const sel = selectIllustration(positions, pos, hasCarry)
+  if (!force && current && current.source === 'chapter') {
+    if (sel.source !== 'chapter') return null
+    if (sel.index < current.index) return null
+  }
+  return sel
+}
+
 // ---------------------------------------------------------------- smooth scrolling
 
 /**
